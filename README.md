@@ -50,8 +50,8 @@ supported — the installer removes the other when you switch.
 | | Apple Container | Docker |
 |---|---|---|
 | Plugin | `hermes-projects-apple` | `hermes-projects-docker` |
-| Needs `docker-wrapper` shim | **yes** | no |
-| Install | `./install.sh` then `./install-plugins.sh apple` | `./install-plugins.sh docker` |
+| Needs `docker-wrapper` shim | **yes** (bundled in the plugin) | no |
+| Install | `./install-plugins.sh apple` | `./install-plugins.sh docker` |
 | Workspace mount driven by | the shim, from the task label | `host_cwd` override in the plugin |
 | Extra config needed | none | `docker_mount_cwd_to_workspace: true` |
 
@@ -76,19 +76,32 @@ translation. Docker supports all of that natively, so the plugin is enough.
 ### Apple Container
 
 ```bash
-./install.sh                  # the docker-compatible shim
-./install-plugins.sh apple    # per-project scoping
+./install-plugins.sh apple
 ```
 
-`install.sh` symlinks `~/.hermes/docker-wrapper` at this repo (so edits here are
-live) and points `HERMES_DOCKER_BINARY` at it in `~/.hermes/.env`.
-**Nothing on the system is replaced** — `/usr/local/bin/docker` and anything on
-`PATH` are left alone. The gateway needs no restart for shim changes: it is a
-fresh process on every `docker` call.
+That is the whole install. The shim ships **inside** the plugin
+(`plugins/hermes-projects-apple/docker-wrapper`), and the plugin points
+`HERMES_DOCKER_BINARY` at its own copy at load time — so there is no second
+step and no `~/.hermes/.env` edit.
 
-`install-plugins.sh` installs into `~/.hermes/plugins/`, adds the plugin to the
-`plugins.enabled` allow-list, and restarts the gateway (needed, because the
-plugin loads into the gateway process).
+The installer copies the plugin into `~/.hermes/plugins/`, adds it to the
+`plugins.enabled` allow-list, and restarts the gateway (required — the plugin
+loads into the gateway process).
+
+**Nothing on the system is replaced.** `/usr/local/bin/docker` and anything on
+`PATH` are left alone; `HERMES_DOCKER_BINARY` simply outranks them.
+
+<details>
+<summary>Optional: <code>./install.sh</code> — develop against the repo</summary>
+
+`install.sh` symlinks `~/.hermes/docker-wrapper` at this repo and writes
+`HERMES_DOCKER_BINARY` into `~/.hermes/.env`. Useful when hacking on the shim,
+since edits are live with no reinstall — the shim is a fresh process on every
+`docker` call. An explicit `HERMES_DOCKER_BINARY` always beats the plugin's
+bundled copy, so this cleanly overrides it.
+
+Not needed for a normal install.
+</details>
 
 ### Docker
 
@@ -114,6 +127,78 @@ Hermes will keep driving Apple Container:
 # HERMES_DOCKER_BINARY=/Users/you/.hermes/docker-wrapper
 ```
 
+### Manual install (no scripts)
+
+The scripts only copy files and edit config — every step is reproducible by
+hand. `<repo>` is your clone of this repository.
+
+**1. Copy the plugin.** The Apple plugin bundles the shim, so this one step
+carries everything:
+
+```bash
+mkdir -p ~/.hermes/plugins
+cp -R <repo>/plugins/hermes-projects-apple ~/.hermes/plugins/    # or -docker
+```
+
+**2. Copy the shared core.** It is maintained once at `plugins/project_scope.py`
+and copied into whichever plugin you installed, so the two can't drift:
+
+```bash
+cp <repo>/plugins/project_scope.py ~/.hermes/plugins/hermes-projects-apple/
+```
+
+**3. Make the shim executable** (Apple backend only). `find_docker()` skips
+anything without the executable bit, and a hand-copied file can lose it:
+
+```bash
+chmod +x ~/.hermes/plugins/hermes-projects-apple/docker-wrapper
+```
+
+The plugin points `HERMES_DOCKER_BINARY` at this bundled copy itself, so no
+`~/.hermes/.env` edit is needed. To use a shim elsewhere, set the variable
+explicitly — an explicit value always wins:
+
+```bash
+echo 'HERMES_DOCKER_BINARY=/path/to/docker-wrapper' >> ~/.hermes/.env
+```
+
+**4. Enable it.** Plugins are opt-in via an allow-list in
+`~/.hermes/config.yaml`. Add the block if it isn't there:
+
+```yaml
+plugins:
+  enabled:
+    - hermes-projects-apple      # or hermes-projects-docker
+```
+
+**5. Docker backend only** — make the workspace mount follow the project:
+
+```yaml
+terminal:
+  docker_mount_cwd_to_workspace: true
+```
+
+and remove any fixed `:/workspace` entry from `terminal.docker_volumes`.
+
+**6. Remove the file patch if you ever applied it.** It and the plugin must not
+both be active — see [The superseded file patch](#the-superseded-file-patch):
+
+```bash
+python3 <repo>/patches/per-project-task-id.py --revert
+```
+
+**7. Restart the gateway** so the plugin loads:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
+```
+
+Confirm with `hermes plugins list` (it should show `enabled`) and:
+
+```bash
+grep -a "scoping active" ~/.hermes/logs/agent.log
+```
+
 ### Switching backends
 
 ```bash
@@ -122,7 +207,7 @@ Hermes will keep driving Apple Container:
 
 The installer removes the other plugin, reverts the superseded file patch if
 present, and restarts the gateway. Switching **to** Docker additionally needs
-the `.env` change above; switching **to** Apple needs `./install.sh` to have run.
+the `.env` change above; switching **to** Apple needs nothing extra — the plugin carries its own shim.
 
 Existing containers are not migrated — they keep their old labels and mounts.
 Delete them so each project gets a fresh one:

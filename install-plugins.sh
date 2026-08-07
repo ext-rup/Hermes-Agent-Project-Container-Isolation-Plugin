@@ -31,6 +31,11 @@ python3 -m unittest discover -s "$REPO_DIR/tests" -q
 # never drift apart.
 echo "==> Syncing shared core into $PLUGIN"
 cp "$REPO_DIR/plugins/project_scope.py" "$SRC/project_scope.py"
+# The Apple plugin bundles the shim, so installing the plugin is enough --
+# no separate install.sh run and no ~/.hermes/.env edit needed.
+if [[ "$BACKEND" == "apple" ]]; then
+    chmod +x "$SRC/docker-wrapper" 2>/dev/null || true
+fi
 
 echo "==> Reverting the file patch (the plugin supersedes it)"
 python3 "$REPO_DIR/patches/per-project-task-id.py" --revert
