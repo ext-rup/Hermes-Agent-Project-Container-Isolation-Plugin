@@ -1,0 +1,6 @@
+name: hermes-projects-apple
+version: 1.0.0
+description: "Per-project containers on Apple Container. Each Hermes project gets its own container with its project directory mounted at /workspace, routed automatically from the project chat."
+author: "Hermes Containers"
+hooks:
+  - on_session_start

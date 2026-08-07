@@ -1,0 +1,237 @@
+# Hermes Containers
+
+A `docker` shim that runs Hermes Agent on **Apple Container** instead of Docker,
+with **one container per Hermes project**, each with its own project directory
+bind-mounted at `/workspace`.
+
+## The problem
+
+Hermes shells out to `docker`. Apple's `container` CLI is close but not
+compatible, and two gaps matter:
+
+1. **Container sprawl.** Hermes reuses containers per `(task_id, profile)` by
+   probing `docker ps -a --filter label=hermes-task-id=<id> --format "{{.ID}}\t{{.State}}"`
+   (`tools/environments/docker.py`, `_find_reusable_container`). Apple Container
+   has **no `--filter`** and its `--format` takes only `json|table|yaml|toml` —
+   no Go templates. A shim that merely translates flags makes that probe fail,
+   so Hermes starts a *fresh* container on every launch and never reuses one.
+
+2. **No per-project isolation.** The `/workspace` mount comes from either a
+   static `terminal.docker_volumes` entry or the process-wide `TERMINAL_CWD`,
+   read once at container-create time. `project_switch` only re-anchors the GUI
+   session (`_apply_workspace`) — it never changes what is mounted. So every
+   project shares one container and one workspace.
+
+## How this fixes it
+
+The shim implements `ps` faithfully — client-side label filtering plus a
+Go-template subset rendered over `container list --format json` — which restores
+Hermes' native reuse. On top of that, at `docker run` time it rewrites:
+
+| What | From | To |
+|---|---|---|
+| `hermes-task-id` label | `default` | `default.alpha` |
+| `/workspace` mount source | whatever Hermes passes | the active project's path |
+| `/root` sandbox home | `…/sandboxes/docker/default/home` | `…/sandboxes/docker/default.alpha/home` |
+
+Because Hermes keys reuse on that label, **scoping the label is all it takes**
+to get one container per project. Hermes then finds the right container by
+itself — no name-hijacking, no mapping table, no polling.
+
+The active project comes from Hermes' own database
+(`~/.hermes/projects.db`, `project_meta.active_id`) — the same store the desktop
+UI and the `project_switch` tool write to.
+
+## Install
+
+```bash
+./install.sh
+```
+
+**Nothing on the system is replaced**, and the gateway does not need restarting —
+the shim is a fresh process on every `docker` call.
+
+Hermes resolves its container runtime through `find_docker()`
+(`tools/environments/docker.py`), and its first step is the
+`HERMES_DOCKER_BINARY` env var, loaded from `~/.hermes/.env` at runtime:
+
+```
+HERMES_DOCKER_BINARY=/Users/you/.hermes/docker-wrapper
+```
+
+The installer symlinks that path at this repo, so edits here are live.
+
+That variable outranks `PATH`, which matters more than it looks: the gateway's
+`PATH` begins with `…/hermes-agent/venv/bin`, and if the
+[`docker-for-apple-container`](https://github.com/appautomaton/docker-for-apple-container)
+package is pip-installed it puts a `docker` console-script there that shadows
+`/usr/local/bin/docker`. `HERMES_DOCKER_BINARY` beats both, so neither needs
+uninstalling.
+
+> Two things that mislead people here (both cost time on this project):
+> - `terminal.docker_executable` in `config.yaml` is **inert** — nothing in
+>   Hermes reads it.
+> - Some docs claim `HERMES_DOCKER_BINARY` is unsupported. It is in fact
+>   resolution step #1.
+>
+> Also note `~/.hermes/.env` **overrides** `config.yaml`: e.g.
+> `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True` there wins over
+> `docker_mount_cwd_to_workspace: false` in the YAML. Check `.env` first when
+> the two disagree — and note it is loaded at runtime, so the values never
+> appear in `ps eww` output for the gateway process.
+
+Verify:
+
+```bash
+./docker-wrapper version    # -> "build apple-container-shim"
+./docker-wrapper ps -a --filter label=hermes-agent=1 \
+    --format '{{.ID}}	{{.Label "hermes-task-id"}}'
+```
+
+### Hermes config
+
+```yaml
+terminal:
+  backend: docker
+  cwd: /workspace
+```
+
+You can **delete** any hardcoded `terminal.docker_volumes` workspace entries.
+When no `/workspace` volume is given, Hermes mounts its own sandbox workspace
+directory there, and the shim repoints that at the active project just the same.
+
+## Configuration
+
+`~/.hermes/docker-wrapper.json` — all keys optional:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `per_project` | `true` | Set `false` to make the shim a pure translator (useful for bisecting) |
+| `drop_foreign_subworkspace_mounts` | `true` | Drop `…:/workspace/Sub` mounts whose source is outside the active project, instead of leaking one project's files into another |
+| `fallback_project_path` | `""` | Workspace to use when no project is active |
+
+Environment:
+
+- `HERMES_PROJECT_SLUG` — force a project, overriding the DB
+- `HERMES_WRAPPER_DEBUG=1` — log every translated command to stderr
+
+## Behaviour notes
+
+- **`--network=none` is refused (exit 125)** rather than silently dropped.
+  Apple Container has no air-gapped mode; dropping the flag would hand the
+  agent network access that Hermes explicitly asked to deny.
+- **`--pids-limit`, `--storage-opt`, `--security-opt`, `--privileged`** and
+  similar are dropped — Apple Container has no equivalent.
+- **`docker exec -i/-t` are preserved.** Apple Container's `exec` does support
+  them, despite what some wrapper guides claim.
+- **State names are translated**: Apple Container's `stopped` is reported as
+  Docker's `exited`, so Hermes' `state != "running"` logic behaves identically.
+- **`docker inspect --format`** supports the fields Hermes reads
+  (`{{.State.FinishedAt}}`, `{{.HostConfig.NetworkMode}}`). `FinishedAt` is
+  always empty — Apple Container does not record it — which Hermes already
+  treats as "unknown".
+
+## The plugin (required)
+
+The shim alone is **not sufficient**, and this took a while to establish.
+See "Why a Hermes-side change is unavoidable" below for the reasoning.
+
+Install one of the two — they wrap the same function, so never both:
+
+```bash
+./install-plugins.sh apple     # Apple Container (uses the shim)
+./install-plugins.sh docker    # real Docker (no shim needed)
+```
+
+This modifies **no Hermes source files**, so `hermes update` doesn't clobber
+it. It installs into `~/.hermes/plugins/` and adds the plugin to the
+`plugins.enabled` allow-list in `config.yaml`.
+
+`plugins/project_scope.py` is the single source of truth for both plugins;
+`install-plugins.sh` copies it in, so the two can't drift.
+
+### How the project is resolved
+
+Two signals, in order:
+
+1. **The session's own cwd** — `state.db`, `sessions.cwd`, matched against
+   project folders by *longest prefix* (so a project nested inside another
+   resolves to the inner one).
+2. **The globally active project** — `projects.db`, `project_meta.active_id`,
+   as a fallback when the session has no usable cwd.
+
+Signal 1 is what makes **concurrent** execution correct. Resolving from the
+global `active_id` alone — as the earlier file patch did — means two sessions
+running at the same time in different projects both read whichever project was
+active at that instant and share a container.
+
+The wrapper calls Hermes' original function first and only scopes a `"default"`
+result, so RL/benchmark isolation ids pass through untouched and upstream
+changes to that logic are inherited rather than overridden. Any failure falls
+back to stock behaviour.
+
+### The superseded file patch
+
+`patches/per-project-task-id.py` does the same job by editing
+`tools/terminal_tool.py` directly. The plugin supersedes it — it survives
+updates and fixes concurrency. `install-plugins.sh` reverts it automatically
+(verified byte-identical to pristine upstream). To revert by hand:
+
+```bash
+python3 patches/per-project-task-id.py --revert
+```
+
+Do not run both: the patch makes the function return a scoped id, which the
+plugin's wrapper then treats as an isolation-keyed task and leaves alone —
+silently disabling the per-session resolution.
+
+## Why a Hermes-side change is unavoidable
+
+`_resolve_container_task_id()` collapses every chat session's `task_id` to
+`"default"`, and `_active_environments` is keyed on that. So Hermes builds one
+environment object per gateway process and reuses it for every chat in every
+project — and because the cached object is reused directly, it never shells out
+to `docker` again. That decision happens *above* the docker layer: there is no
+invocation for a shim to intercept, so no amount of shim work reaches it.
+
+`patches/per-project-task-id.py` scopes that return value by active project, so
+the cache keys per project and each project chat builds its own environment.
+It is idempotent, backs up the file, syntax-checks the result and restores on
+failure. `install.sh` runs it.
+
+**Superseded by the plugin** — kept for reference and for anyone who prefers a
+`tools/terminal_tool.py`:
+
+```bash
+python3 patches/per-project-task-id.py
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
+```
+
+### Why the idle timer masks this
+
+`terminal.lifetime_seconds` (default 300) drives `_cleanup_inactive_envs()`,
+which evicts the cached environment after that much idle time; persist-mode
+`cleanup()` leaves the container running. So after ~5 idle minutes the next
+message rebuilds the environment, calls the shim, and *does* route correctly.
+Switch projects quickly and it doesn't. That intermittency is why this looks
+like a flaky mount bug rather than a caching one.
+
+Lowering `lifetime_seconds` is not a fix: the eviction thread polls on a
+hardcoded 60s loop, and the orphan reaper deletes labeled containers untouched
+for `2 × lifetime_seconds` at startup — so a low value would reap your other
+projects' containers on every restart.
+
+## Known limitation
+
+Switching projects *mid-turn* still uses the environment built at the start of
+that turn. Any new message picks up the current project.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Covers label scoping and idempotency, project resolution from the DB, the
+Go-template subset (including the exact templates Hermes uses), `ps` filter
+scoping, volume splitting with spaces in paths, and run-arg rewriting.

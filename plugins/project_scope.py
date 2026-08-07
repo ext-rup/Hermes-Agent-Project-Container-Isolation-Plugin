@@ -1,0 +1,456 @@
+"""Per-project container scoping for Hermes Agent.
+
+Canonical source. ``install-plugins.sh`` copies this into each plugin
+directory, so edit it here — never the copies.
+
+What it does
+------------
+Hermes collapses every chat session's ``task_id`` to ``"default"``
+(``tools/terminal_tool._resolve_container_task_id``), and
+``_active_environments`` is keyed on that. One environment object therefore
+serves every project in a gateway process, and because the cached object is
+reused directly Hermes never shells out to ``docker`` again — so a docker-level
+shim cannot influence which container a project gets.
+
+This module wraps that function so the returned id carries the project, giving
+each project its own environment, container and ``/workspace``.
+
+Resolving the project
+---------------------
+Two signals, in order:
+
+1. **The session's own cwd** (``state.db``, ``sessions.cwd``), matched against
+   the project folders in ``projects.db``. This is per-session, so two projects
+   executing *concurrently* resolve independently.
+
+2. **The globally active project** (``projects.db``, ``project_meta.active_id``)
+   as a fallback when the session has no usable cwd — e.g. a brand-new session
+   whose first row has not been written yet.
+
+Signal 1 is what makes concurrent execution correct. Relying on the global
+``active_id`` alone would make two simultaneous sessions in different projects
+resolve to whichever project happened to be active at that instant, and share a
+container.
+
+Longest-prefix matching is deliberate: with folders ``…/Alpha`` and
+``…/Alpha/nested/Subproject`` registered as separate projects, a
+session inside the latter must resolve to ``subproject``, not ``alpha``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import sqlite3
+import threading
+import time
+from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+_LABEL_SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+# _resolve_container_task_id runs on every terminal and file-tool call, so the
+# two SQLite reads are cached briefly. Short enough that switching projects
+# feels immediate; long enough that a burst of tool calls in one turn does not
+# re-query per call.
+_CACHE_TTL = 2.0
+
+# A fallback to the global active_id is a guess: it means the session's row
+# hasn't been written to state.db yet (rows are written asynchronously, so a
+# brand-new chat's first tool call can arrive first). Caching that guess for
+# the full TTL pins the wrong project for two seconds — long enough to create
+# a container and run the first command in another project's workspace.
+# Re-check almost immediately instead, so the real answer wins as soon as the
+# row lands.
+_FALLBACK_CACHE_TTL = 0.2
+
+# One entry per session id, so an unbounded dict grows for the lifetime of the
+# gateway. Prune expired entries once it exceeds this, and hard-trim the oldest
+# if they are all still live.
+_CACHE_MAX = 512
+
+_cache: dict = {}
+_cache_lock = threading.Lock()
+
+# The project folder list changes only when projects are added or moved, so it
+# is cached against projects.db's (mtime, size) instead of being re-queried on
+# every resolution. Paths are realpath'd once here rather than per call.
+_folders_cache: dict = {}
+_folders_lock = threading.Lock()
+
+
+def _prune_cache_locked(now: float) -> None:
+    """Drop expired entries; if still oversized, drop the oldest. Caller holds
+    the lock."""
+    for key, (stamp, _slug, source) in list(_cache.items()):
+        ttl = _CACHE_TTL if source == "session" else _FALLBACK_CACHE_TTL
+        if now - stamp >= ttl:
+            _cache.pop(key, None)
+    if len(_cache) > _CACHE_MAX:
+        for key, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[
+            : len(_cache) - _CACHE_MAX
+        ]:
+            _cache.pop(key, None)
+
+
+def _hermes_home() -> str:
+    return os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
+
+
+def _connect_ro(db_path: str) -> Optional[sqlite3.Connection]:
+    """Open *db_path* for reading, or return None.
+
+    Both databases run in WAL mode. A ``mode=ro`` open needs the ``-shm``
+    sidecar, and when that has been checkpointed away SQLite cannot create it
+    and fails with "unable to open database file" — so fall back to a normal
+    connection, which is what Hermes' own ``projects_db.connect()`` uses.
+
+    ``immutable=1`` would also open without the sidecar, but it bypasses the
+    WAL and would read stale rows. Never use it here: a stale ``active_id`` or
+    a missing session row is exactly the failure this must avoid.
+    """
+    if not os.path.exists(db_path):
+        return None
+    for dsn, kwargs in ((f"file:{db_path}?mode=ro", {"uri": True}), (db_path, {})):
+        try:
+            return sqlite3.connect(dsn, timeout=2.0, **kwargs)
+        except sqlite3.Error:
+            continue
+    return None
+
+
+def sanitize(value: str) -> str:
+    return _LABEL_SAFE_RE.sub("_", str(value))[:40]
+
+
+def _session_cwd(task_id: str) -> Optional[str]:
+    """Host cwd recorded for *task_id*, or None.
+
+    ``sessions.id`` uses the same value the terminal tool receives as
+    ``task_id`` (e.g. ``20260807_105303_df4fdd``). ``session_key`` is checked
+    too since gateway sessions are registered under it.
+    """
+    conn = _connect_ro(os.path.join(_hermes_home(), "state.db"))
+    if conn is None:
+        return None
+    try:
+        # Two queries, not "id = ? OR session_key = ?": the OR cannot use the
+        # primary-key index, so it degrades to a table scan. The sessions
+        # table is small in practice, so this is a safeguard for large
+        # installs rather than a measured win here — the id lookup hits the
+        # PK and answers almost always; session_key is a fallback because the
+        # gateway registers some sessions under it.
+        row = conn.execute(
+            "SELECT cwd FROM sessions WHERE id = ? LIMIT 1", (task_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            row = conn.execute(
+                "SELECT cwd FROM sessions WHERE session_key = ? LIMIT 1", (task_id,)
+            ).fetchone()
+    except sqlite3.Error as e:
+        logger.debug("session cwd lookup failed: %s", e)
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    return os.path.abspath(os.path.expanduser(str(row[0])))
+
+
+def _project_folders():
+    """[(slug, abspath, realpath)], cached against projects.db's mtime+size."""
+    db = os.path.join(_hermes_home(), "projects.db")
+    try:
+        st = os.stat(db)
+        stamp = (db, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return []
+
+    with _folders_lock:
+        hit = _folders_cache.get("v")
+        if hit and hit[0] == stamp:
+            return hit[1]
+
+    conn = _connect_ro(db)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT p.slug, f.path FROM project_folders f "
+            "JOIN projects p ON p.id = f.project_id "
+            "UNION "
+            "SELECT slug, primary_path FROM projects "
+            "WHERE primary_path IS NOT NULL AND primary_path != ''"
+        ).fetchall()
+    except sqlite3.Error as e:
+        logger.debug("project folder lookup failed: %s", e)
+        return []
+    finally:
+        conn.close()
+
+    folders = []
+    for slug, folder in rows:
+        if not folder:
+            continue
+        root = os.path.abspath(os.path.expanduser(str(folder)))
+        # realpath too, so a session cwd reached through a symlinked parent
+        # still matches its project.
+        try:
+            real = os.path.realpath(root)
+        except OSError:
+            real = root
+        folders.append((slug, root, real))
+
+    with _folders_lock:
+        _folders_cache["v"] = (stamp, folders)
+    return folders
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _project_for_path(path: str) -> Optional[str]:
+    """Slug of the project owning *path*, by longest-prefix match.
+
+    Longest wins so a project nested inside another (…/Alpha/…/Subproject
+    within …/Alpha) resolves to the inner one.
+    """
+    folders = _project_folders()
+    if not folders:
+        return None
+    try:
+        real_path = os.path.realpath(path)
+    except OSError:
+        real_path = path
+
+    best_slug, best_len = None, -1
+    for slug, root, real_root in folders:
+        if _under(path, root):
+            match_len = len(root)
+        elif _under(real_path, real_root):
+            match_len = len(real_root)
+        else:
+            continue
+        if match_len > best_len:
+            best_slug, best_len = slug, match_len
+    return best_slug
+
+
+def _active_project_slug() -> Optional[str]:
+    conn = _connect_ro(os.path.join(_hermes_home(), "projects.db"))
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT p.slug FROM project_meta m JOIN projects p ON p.id = m.value "
+            "WHERE m.key = 'active_id'"
+        ).fetchone()
+    except sqlite3.Error as e:
+        logger.debug("active project lookup failed: %s", e)
+        return None
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else None
+
+
+# Set at tool entry, where both task_id and session_id are in scope.
+# _resolve_container_task_id() only receives task_id, and Hermes' own docstring
+# says the top-level agent passes task_id=None — in which case the session id
+# is the only per-session discriminator available, and without it concurrent
+# projects would collapse onto the global active_id and share a container.
+_current = threading.local()
+
+
+def note_ids(task_id: Optional[str], session_id: Optional[str]) -> None:
+    _current.ids = (task_id, session_id)
+
+
+def clear_ids(previous) -> None:
+    _current.ids = previous
+
+
+def current_ids():
+    return getattr(_current, "ids", None)
+
+
+def _candidate_ids(task_id: Optional[str]):
+    """Session identifiers to try, most specific first, de-duplicated."""
+    seen, out = set(), []
+    for cand in (task_id,) + (current_ids() or (None, None)):
+        if cand and cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
+    """Return ``(slug, source)`` for *task_id*. ``slug`` is None if unknown.
+
+    ``source`` is "session", "active" or "none" — reported so the reason a
+    container was chosen is visible in the logs.
+    """
+    candidates = _candidate_ids(task_id)
+    key = "|".join(candidates)
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit:
+            ttl = _CACHE_TTL if hit[2] == "session" else _FALLBACK_CACHE_TTL
+            if now - hit[0] < ttl:
+                return hit[1], hit[2]
+
+    slug, source = None, "none"
+    for cand in candidates:
+        cwd = _session_cwd(cand)
+        if not cwd:
+            continue
+        found = _project_for_path(cwd)
+        if found:
+            slug, source = found, "session"
+            break
+    if slug is None:
+        found = _active_project_slug()
+        if found:
+            slug, source = found, "active"
+
+    with _cache_lock:
+        _cache[key] = (now, slug, source)
+        if len(_cache) > _CACHE_MAX:
+            _prune_cache_locked(now)
+    return slug, source
+
+
+def project_path_for_task(task_id: Optional[str]) -> Optional[str]:
+    """Primary directory of the project owning *task_id*, or None.
+
+    Used by the Docker plugin to make the ``/workspace`` bind mount follow the
+    project. The Apple Container variant does not need this — its shim rewrites
+    the mount at ``docker run`` time.
+    """
+    slug, _ = resolve_project_slug(task_id)
+    if not slug:
+        return None
+    conn = _connect_ro(os.path.join(_hermes_home(), "projects.db"))
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(NULLIF(p.primary_path, ''), "
+            "  (SELECT f.path FROM project_folders f "
+            "   WHERE f.project_id = p.id ORDER BY f.is_primary DESC LIMIT 1)) "
+            "FROM projects p WHERE p.slug = ?",
+            (slug,),
+        ).fetchone()
+    except sqlite3.Error as e:
+        logger.debug("project path lookup failed: %s", e)
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    path = os.path.abspath(os.path.expanduser(str(row[0])))
+    return path if os.path.isdir(path) else None
+
+
+def scoped_task_id(task_id: Optional[str], base: str) -> str:
+    """Scope *base* by the project owning *task_id*.
+
+    Idempotent, so an already-scoped value passed back in is unchanged.
+    """
+    slug, source = resolve_project_slug(task_id)
+    if not slug:
+        return base
+    slug = sanitize(slug)
+    if base.endswith("." + slug):
+        return base
+    scoped = f"{base}.{slug}"
+    if source == "active":
+        # Fell back to the global active project. Correct for a single session,
+        # but concurrent sessions in different projects would both land here
+        # and share a container — so say so rather than fail quietly.
+        logger.info(
+            "project scope: task_id=%r -> %s via global active_id "
+            "(no session cwd found; concurrent projects may collide)",
+            task_id, scoped,
+        )
+    else:
+        logger.info("project scope: task_id=%r -> %s via %s", task_id, scoped, source)
+    return scoped
+
+
+def install(terminal_tool) -> bool:
+    """Wrap ``terminal_tool._resolve_container_task_id`` in place.
+
+    Wrapping rather than replacing means Hermes' own logic still runs first —
+    including the RL/benchmark isolation-key branch, which must keep returning
+    its raw task_id untouched. Only the "default" outcome gets scoped, so an
+    upstream change to the isolation rules is inherited automatically instead
+    of being silently overridden.
+
+    Idempotent: a second call is a no-op.
+    """
+    original = getattr(terminal_tool, "_resolve_container_task_id", None)
+    if original is None:
+        logger.warning(
+            "per-project scoping not installed: "
+            "terminal_tool._resolve_container_task_id is missing "
+            "(Hermes changed upstream)"
+        )
+        return False
+    if getattr(original, "_hermes_containers_wrapped", False):
+        return True
+
+    def wrapped(task_id=None):
+        base = original(task_id)
+        # Anything but "default" is an isolation-keyed task (RL/benchmark
+        # rollouts) that already has its own sandbox — leave it alone.
+        if base != "default":
+            return base
+        try:
+            return scoped_task_id(task_id, base)
+        except Exception as e:
+            logger.warning("per-project scoping failed, using %r: %s", base, e)
+            return base
+
+    wrapped._hermes_containers_wrapped = True  # type: ignore[attr-defined]
+    wrapped._hermes_containers_original = original  # type: ignore[attr-defined]
+    terminal_tool._resolve_container_task_id = wrapped
+
+    _install_id_capture(terminal_tool)
+    return True
+
+
+def _install_id_capture(terminal_tool) -> bool:
+    """Record (task_id, session_id) at tool entry for the current thread.
+
+    ``_resolve_container_task_id`` only receives ``task_id``, which the
+    top-level agent may pass as None. ``terminal_tool()`` receives
+    ``session_id`` as well, and runs on the same thread, so capturing both here
+    gives the resolver a per-session discriminator in either case.
+
+    Without this, concurrent sessions whose ``task_id`` is None would all fall
+    through to the global ``active_id`` and share one container — the exact
+    failure this design exists to prevent.
+    """
+    entry = getattr(terminal_tool, "terminal_tool", None)
+    if entry is None or getattr(entry, "_hermes_containers_wrapped", False):
+        return False
+
+    def wrapped_entry(*args, **kwargs):
+        previous = current_ids()
+        try:
+            note_ids(kwargs.get("task_id"), kwargs.get("session_id"))
+        except Exception:
+            pass
+        try:
+            return entry(*args, **kwargs)
+        finally:
+            clear_ids(previous)
+
+    wrapped_entry._hermes_containers_wrapped = True  # type: ignore[attr-defined]
+    wrapped_entry._hermes_containers_original = entry  # type: ignore[attr-defined]
+    terminal_tool.terminal_tool = wrapped_entry
+    return True
