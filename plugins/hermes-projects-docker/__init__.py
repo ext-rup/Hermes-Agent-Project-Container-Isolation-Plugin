@@ -21,10 +21,32 @@ Enable exactly one of hermes-projects-apple / hermes-projects-docker.
 from __future__ import annotations
 
 import logging
+import os
 
 from . import project_scope
 
 logger = logging.getLogger(__name__)
+
+
+def _check_docker_binary() -> None:
+    """Warn if Hermes is still pointed at the Apple Container shim.
+
+    Switching from the Apple backend leaves HERMES_DOCKER_BINARY set in
+    ~/.hermes/.env. find_docker() checks it before PATH, so Hermes would keep
+    driving Apple Container while this Docker plugin manages the scoping —
+    a confusing half-configured state.
+    """
+    binary = (os.environ.get("HERMES_DOCKER_BINARY") or "").strip()
+    if not binary:
+        return
+    name = os.path.basename(binary)
+    if "docker-wrapper" in name or "apple" in name.lower():
+        logger.warning(
+            "HERMES_DOCKER_BINARY=%s looks like the Apple Container shim, but "
+            "the Docker backend plugin is enabled. Remove that line from "
+            "~/.hermes/.env, or switch back with ./install-plugins.sh apple.",
+            binary,
+        )
 
 
 def _check_mount_config() -> None:
@@ -109,6 +131,7 @@ def _on_session_start(*args, **kwargs):
 
 
 def register(ctx) -> None:
+    _check_docker_binary()
     _check_mount_config()
     _install()
     ctx.register_hook("on_session_start", _on_session_start)

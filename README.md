@@ -42,27 +42,121 @@ The active project comes from Hermes' own database
 (`~/.hermes/projects.db`, `project_meta.active_id`) — the same store the desktop
 UI and the `project_switch` tool write to.
 
+## Choosing a backend
+
+Pick **one**. The two plugins wrap the same function, so enabling both is not
+supported — the installer removes the other when you switch.
+
+| | Apple Container | Docker |
+|---|---|---|
+| Plugin | `hermes-projects-apple` | `hermes-projects-docker` |
+| Needs `docker-wrapper` shim | **yes** | no |
+| Install | `./install.sh` then `./install-plugins.sh apple` | `./install-plugins.sh docker` |
+| Workspace mount driven by | the shim, from the task label | `host_cwd` override in the plugin |
+| Extra config needed | none | `docker_mount_cwd_to_workspace: true` |
+
+Apple Container needs the shim because its CLI is not Docker-compatible — no
+`--filter`, no Go templates — so Hermes' container-reuse probe fails without
+translation. Docker supports all of that natively, so the plugin is enough.
+
+> **Status:** the Apple Container path is used daily and verified end to end.
+> The Docker path is unit-tested but has **never been run against a live Docker
+> daemon**. Treat it as unverified.
+
 ## Install
 
+### Requirements
+
+- Hermes Agent installed at `~/.hermes/hermes-agent` (a git checkout)
+- `terminal.backend: docker` in `~/.hermes/config.yaml`
+- Apple Container backend: macOS on Apple Silicon with the `container` CLI
+  (`brew install container`)
+- Docker backend: a running Docker daemon
+
+### Apple Container
+
 ```bash
-./install.sh
+./install.sh                  # the docker-compatible shim
+./install-plugins.sh apple    # per-project scoping
 ```
 
-**Nothing on the system is replaced**, and the gateway does not need restarting —
-the shim is a fresh process on every `docker` call.
+`install.sh` symlinks `~/.hermes/docker-wrapper` at this repo (so edits here are
+live) and points `HERMES_DOCKER_BINARY` at it in `~/.hermes/.env`.
+**Nothing on the system is replaced** — `/usr/local/bin/docker` and anything on
+`PATH` are left alone. The gateway needs no restart for shim changes: it is a
+fresh process on every `docker` call.
 
-Hermes resolves its container runtime through `find_docker()`
-(`tools/environments/docker.py`), and its first step is the
-`HERMES_DOCKER_BINARY` env var, loaded from `~/.hermes/.env` at runtime:
+`install-plugins.sh` installs into `~/.hermes/plugins/`, adds the plugin to the
+`plugins.enabled` allow-list, and restarts the gateway (needed, because the
+plugin loads into the gateway process).
 
+### Docker
+
+```bash
+./install-plugins.sh docker
 ```
-HERMES_DOCKER_BINARY=/Users/you/.hermes/docker-wrapper
+
+Then make the workspace mount follow the project:
+
+```bash
+hermes config set terminal.docker_mount_cwd_to_workspace true
 ```
 
-The installer symlinks that path at this repo, so edits here are live.
+and remove any fixed `:/workspace` entry from `terminal.docker_volumes` — a
+hardcoded host path there would be mounted for *every* project. The plugin logs
+a warning at startup if either is wrong.
 
-That variable outranks `PATH`, which matters more than it looks: the gateway's
-`PATH` begins with `…/hermes-agent/venv/bin`, and if the
+If you previously used the Apple backend, also clear the shim override, or
+Hermes will keep driving Apple Container:
+
+```bash
+# in ~/.hermes/.env — remove or comment out
+# HERMES_DOCKER_BINARY=/Users/you/.hermes/docker-wrapper
+```
+
+### Switching backends
+
+```bash
+./install-plugins.sh docker   # or: apple
+```
+
+The installer removes the other plugin, reverts the superseded file patch if
+present, and restarts the gateway. Switching **to** Docker additionally needs
+the `.env` change above; switching **to** Apple needs `./install.sh` to have run.
+
+Existing containers are not migrated — they keep their old labels and mounts.
+Delete them so each project gets a fresh one:
+
+```bash
+container list --all                       # or: docker ps -a
+container stop <id> && container delete <id>
+```
+
+### Verify
+
+```bash
+./docker-wrapper version    # Apple backend only -> "build apple-container-shim"
+
+# Which project each container belongs to, and where its workspace points:
+container list --all --format json | python3 -c 'import json,sys
+for c in json.load(sys.stdin):
+    cfg = c["configuration"]
+    ws = [m["source"] for m in cfg["mounts"] if m["destination"] == "/workspace"]
+    print(cfg["id"], cfg["labels"].get("hermes-task-id"), ws)'
+
+# Every routing decision, with the signal it used:
+grep -a "project scope:" ~/.hermes/logs/agent.log | tail
+```
+
+A healthy line reads `-> default.<project> via session`. A line reading
+`via global active_id` means the session's row was not found and the project was
+guessed — see [Known limitation](#known-limitation).
+
+### How Hermes finds the shim
+
+`find_docker()` (`tools/environments/docker.py`) checks `HERMES_DOCKER_BINARY`
+**first**, ahead of `PATH`. That matters more than it looks: the gateway's `PATH`
+begins with `…/hermes-agent/venv/bin`, and if the
 [`docker-for-apple-container`](https://github.com/appautomaton/docker-for-apple-container)
 package is pip-installed it puts a `docker` console-script there that shadows
 `/usr/local/bin/docker`. `HERMES_DOCKER_BINARY` beats both, so neither needs
@@ -79,14 +173,6 @@ uninstalling.
 > `docker_mount_cwd_to_workspace: false` in the YAML. Check `.env` first when
 > the two disagree — and note it is loaded at runtime, so the values never
 > appear in `ps eww` output for the gateway process.
-
-Verify:
-
-```bash
-./docker-wrapper version    # -> "build apple-container-shim"
-./docker-wrapper ps -a --filter label=hermes-agent=1 \
-    --format '{{.ID}}	{{.Label "hermes-task-id"}}'
-```
 
 ### Hermes config
 
