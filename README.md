@@ -271,6 +271,46 @@ You can **delete** any hardcoded `terminal.docker_volumes` workspace entries.
 When no `/workspace` volume is given, Hermes mounts its own sandbox workspace
 directory there, and the shim repoints that at the active project just the same.
 
+## Container image
+
+Hermes' default image (`nikolaik/python-nodejs`) has Python and Node but no
+document tooling, so PDF work in the sandbox fails unless the agent installs
+packages first — and those installs are lost whenever a container is recreated.
+
+`image/Dockerfile` bakes them in:
+
+```bash
+./image/build.sh          # builds hermes-workspace:latest and verifies it
+```
+
+Adds `poppler-utils` (pdftotext, pdftoppm, pdfimages, pdfinfo), `ghostscript`,
+`pypdf`, `pdfplumber` and `Pillow`.
+
+Point Hermes at it in **both** places — `~/.hermes/.env` overrides
+`config.yaml`, so changing only the YAML has no effect:
+
+```bash
+# ~/.hermes/.env
+TERMINAL_DOCKER_IMAGE=hermes-workspace:latest
+```
+```yaml
+# ~/.hermes/config.yaml
+terminal:
+  docker_image: hermes-workspace:latest
+```
+
+Then delete the existing containers. Reuse matches on **labels, not image**, so
+they would otherwise keep running the old one:
+
+```bash
+container list --all
+container stop <id> && container delete <id>
+```
+
+A stock image works too — `nikolaik/python-nodejs:python3.13-nodejs24` is the
+minimum that has Python at all (verified on arm64). An image without Python,
+such as `node:24-bookworm-slim`, leaves the agent unable to run any Python.
+
 ## Configuration
 
 `~/.hermes/docker-wrapper.json` — all keys optional:
