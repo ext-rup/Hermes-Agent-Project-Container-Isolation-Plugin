@@ -66,6 +66,7 @@ class ScopeTestBase(unittest.TestCase):
         os.environ["HERMES_HOME"] = self.home
         ps._cache.clear()
         ps._folders_cache.clear()
+        ps._bindings.clear()
         self.alpha = os.path.join(self.home, "Alpha")
         self.selling = os.path.join(self.alpha, "nested", "Subproject")
         self.beta = os.path.join(self.home, "Beta")
@@ -76,6 +77,7 @@ class ScopeTestBase(unittest.TestCase):
         os.environ.pop("HERMES_HOME", None)
         ps._cache.clear()
         ps._folders_cache.clear()
+        ps._bindings.clear()
 
 
 class TestSessionResolution(ScopeTestBase):
@@ -378,6 +380,82 @@ class TestFolderCaching(ScopeTestBase):
         os.symlink(self.beta, link)
         make_dbs(self.home, [("p2", "beta", self.beta)], [("s", link)], "p2")
         self.assertEqual(ps._project_for_path(link), "beta")
+
+
+class TestStickyBinding(ScopeTestBase):
+    """A session must stay on one project once it has resolved.
+
+    Hermes writes sessions.cwd only after a terminal command settles, so a new
+    session's first call falls back to the global active_id. Without a binding
+    every later call re-reads that global value, so switching projects in the
+    UI would move a running session onto another project's container.
+    """
+
+    def setUp(self):
+        super().setUp()
+        ps._bindings.clear()
+
+    def tearDown(self):
+        ps._bindings.clear()
+        super().tearDown()
+
+    def _set_active(self, project_id):
+        conn = sqlite3.connect(os.path.join(self.home, "projects.db"))
+        conn.execute("INSERT OR REPLACE INTO project_meta (key, value) VALUES ('active_id', ?)",
+                     (project_id,))
+        conn.commit(); conn.close()
+        ps._cache.clear()
+
+    def test_session_sticks_when_active_project_changes(self):
+        make_dbs(
+            self.home,
+            [("p1", "alpha", self.alpha), ("p2", "beta", self.beta)],
+            [],  # no cwd recorded yet — the first-call situation
+            active_id="p1",
+        )
+        first = ps.resolve_project_slug("new-session")
+        self.assertEqual(first, ("alpha", "active"))
+
+        self._set_active("p2")  # user switches project in the UI
+        second = ps.resolve_project_slug("new-session")
+        self.assertEqual(second[0], "alpha", "session moved to another project's container")
+        self.assertEqual(second[1], "bound")
+
+    def test_recorded_cwd_overrides_a_wrong_binding(self):
+        """A session that had to guess corrects itself once cwd is written."""
+        make_dbs(
+            self.home,
+            [("p1", "alpha", self.alpha), ("p2", "beta", self.beta)],
+            [],
+            active_id="p1",
+        )
+        self.assertEqual(ps.resolve_project_slug("late")[0], "alpha")
+
+        conn = sqlite3.connect(os.path.join(self.home, "state.db"))
+        conn.execute("INSERT INTO sessions (id, session_key, cwd) VALUES ('late','',?)",
+                     (self.beta,))
+        conn.commit(); conn.close()
+        ps._cache.clear()
+
+        slug, source = ps.resolve_project_slug("late")
+        self.assertEqual((slug, source), ("beta", "session"))
+
+    def test_bindings_are_bounded(self):
+        make_dbs(self.home, [("p1", "alpha", self.alpha)], [], "p1")
+        for i in range(ps._BINDINGS_MAX * 2):
+            ps.resolve_project_slug("s-%d" % i)
+        self.assertLessEqual(len(ps._bindings), ps._BINDINGS_MAX)
+
+    def test_distinct_sessions_keep_distinct_bindings(self):
+        make_dbs(
+            self.home,
+            [("p1", "alpha", self.alpha), ("p2", "beta", self.beta)],
+            [("has-cwd", self.beta)],
+            active_id="p1",
+        )
+        self.assertEqual(ps.resolve_project_slug("has-cwd")[0], "beta")
+        self.assertEqual(ps.resolve_project_slug("no-cwd")[0], "alpha")
+        self.assertEqual(ps.resolve_project_slug("has-cwd")[0], "beta")
 
 
 class TestProjectPath(ScopeTestBase):

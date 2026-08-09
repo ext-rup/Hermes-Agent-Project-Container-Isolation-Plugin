@@ -384,10 +384,24 @@ Two signals, in order:
 2. **The globally active project** — `projects.db`, `project_meta.active_id`,
    as a fallback when the session has no usable cwd.
 
+Between them sits a **sticky binding**: whatever a session first resolves to is
+remembered, so it stays on one container even if the active project changes
+underneath it. A recorded cwd always overrides the binding, so a session that
+had to guess corrects itself as soon as Hermes writes one.
+
 Signal 1 is what makes **concurrent** execution correct. Resolving from the
 global `active_id` alone — as the earlier file patch did — means two sessions
 running at the same time in different projects both read whichever project was
 active at that instant and share a container.
+
+**Known gap.** Hermes writes `sessions.cwd` only after a terminal command
+settles, and `origin_json`/`git_repo_root` are empty too, so a session's *first*
+call has no per-session signal at all and falls back to the global active
+project. That is normally right — the active project is the chat you just
+opened — but two *brand-new* sessions in different projects making their first
+call at the same time will both bind to whichever is active. There is no
+information available at that moment to tell them apart. Established sessions
+are unaffected. The `via global active_id` log line marks every occurrence.
 
 The wrapper calls Hermes' original function first and only scopes a `"default"`
 result, so RL/benchmark isolation ids pass through untouched and upstream

@@ -80,12 +80,51 @@ _cache_lock = threading.Lock()
 _folders_cache: dict = {}
 _folders_lock = threading.Lock()
 
+# Sticky session → project bindings.
+#
+# Hermes writes sessions.cwd only after a terminal command settles, so a
+# session's *first* call has no per-session signal at all (origin_json and
+# git_repo_root are empty too) and has to fall back to the global active_id.
+# Without a binding, every later call would re-read that global value — so a
+# session could silently change container mid-conversation just because the
+# user switched projects in the UI. Binding the first answer keeps a session
+# on one container for its lifetime.
+#
+# This does not make two *brand-new* sessions in different projects safe: while
+# neither has a recorded cwd there is genuinely nothing to tell them apart, and
+# both bind to whatever is active. A recorded cwd always overrides the binding,
+# so such a session corrects itself as soon as Hermes writes one.
+_BINDINGS_MAX = 512
+_bindings: dict = {}
+_bindings_lock = threading.Lock()
+
+
+def _bind(task_id: Optional[str], slug: str) -> None:
+    if not task_id or not slug:
+        return
+    with _bindings_lock:
+        _bindings[task_id] = slug
+        if len(_bindings) > _BINDINGS_MAX:
+            # Plain FIFO trim; bindings carry no timestamp and the cap only
+            # exists so a long-lived gateway cannot grow this without bound.
+            for key in list(_bindings)[: len(_bindings) - _BINDINGS_MAX]:
+                _bindings.pop(key, None)
+
+
+def _bound(candidates) -> Optional[str]:
+    with _bindings_lock:
+        for cand in candidates:
+            slug = _bindings.get(cand)
+            if slug:
+                return slug
+    return None
+
 
 def _prune_cache_locked(now: float) -> None:
     """Drop expired entries; if still oversized, drop the oldest. Caller holds
     the lock."""
     for key, (stamp, _slug, source) in list(_cache.items()):
-        ttl = _CACHE_TTL if source == "session" else _FALLBACK_CACHE_TTL
+        ttl = _FALLBACK_CACHE_TTL if source == "active" else _CACHE_TTL
         if now - stamp >= ttl:
             _cache.pop(key, None)
     if len(_cache) > _CACHE_MAX:
@@ -298,11 +337,19 @@ def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
     with _cache_lock:
         hit = _cache.get(key)
         if hit:
-            ttl = _CACHE_TTL if hit[2] == "session" else _FALLBACK_CACHE_TTL
+            # A bound answer is as stable as a session-derived one; only a
+            # bare active_id guess is re-checked aggressively, so a session
+            # picks up its real cwd as soon as one is written.
+            ttl = _FALLBACK_CACHE_TTL if hit[2] == "active" else _CACHE_TTL
             if now - hit[0] < ttl:
                 return hit[1], hit[2]
 
     slug, source = None, "none"
+
+    # 1. The session's own cwd — authoritative, and per-session, so concurrent
+    #    projects resolve independently. Overrides any earlier binding, which
+    #    lets a session that had to guess correct itself once Hermes records a
+    #    cwd for it.
     for cand in candidates:
         cwd = _session_cwd(cand)
         if not cwd:
@@ -311,10 +358,24 @@ def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
         if found:
             slug, source = found, "session"
             break
+
+    # 2. What this session resolved to before. Keeps it on one container even
+    #    if the globally active project changes underneath it.
+    if slug is None:
+        found = _bound(candidates)
+        if found:
+            slug, source = found, "bound"
+
+    # 3. Nothing session-specific exists yet: guess the active project and
+    #    remember it, so the guess is made once rather than re-rolled per call.
     if slug is None:
         found = _active_project_slug()
         if found:
             slug, source = found, "active"
+
+    if slug and source in ("session", "active"):
+        for cand in candidates:
+            _bind(cand, slug)
 
     with _cache_lock:
         _cache[key] = (now, slug, source)

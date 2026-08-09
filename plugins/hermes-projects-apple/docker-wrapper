@@ -875,6 +875,12 @@ def _project_for_run(args, config):
         if arg == "--label" and i + 1 < len(args):
             key, sep, val = args[i + 1].partition("=")
             if key == TASK_LABEL and sep:
+                # Shared containers (the backend probe) must not receive any
+                # project's directory: one container is reused by every
+                # project, so mounting the active project's files there would
+                # expose them to all of the others. Claim no project at all.
+                if val in UNSCOPED_TASK_IDS:
+                    return None, None, False
                 _, slug = split_scoped(val, slugs)
                 if slug:
                     return slug, project_path_for_slug(slug), True

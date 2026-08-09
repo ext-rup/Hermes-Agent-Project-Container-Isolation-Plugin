@@ -362,6 +362,14 @@ class TestRunRewriting(unittest.TestCase):
         self.assertIn("hermes-abc123", out)
         self.assertNotIn("hermes-abc123-alpha", out)
 
+    def test_probe_gets_no_project_mount(self):
+        """A container shared by every project must not hold one project's files."""
+        args = ["--label", "hermes-task-id=prompt-backend-probe",
+                "-v", "/sandbox/workspace:/workspace"]
+        slug, path, already = dw._project_for_run(args, dict(dw.DEFAULT_CONFIG))
+        self.assertIsNone(slug)
+        self.assertFalse(already)
+
     def test_image_and_command_survive(self):
         args = ["-d", "--label", "hermes-task-id=default", "-v", "/a:/workspace",
                 "node:24-bookworm-slim", "sleep", "infinity"]
