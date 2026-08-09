@@ -23,31 +23,31 @@ from . import project_scope
 
 logger = logging.getLogger(__name__)
 
-# The shim ships inside this plugin, so installing the plugin is all that is
-# needed — no separate install step and no ~/.hermes/.env edit. A shim placed
-# at ~/.hermes/docker-wrapper (by install.sh, or by hand) is still honoured as
-# a fallback.
+# The shim ships inside this plugin and is used from where the plugin is
+# installed — a real file under ~/.hermes/plugins/, never a symlink back into a
+# checkout. Installing the plugin is therefore the whole install: no second
+# step, no ~/.hermes/.env edit, and nothing that breaks if the repo is moved or
+# deleted.
 BUNDLED_SHIM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker-wrapper")
-LEGACY_SHIM = os.path.expanduser("~/.hermes/docker-wrapper")
 
 
 def _usable_shim() -> str:
-    """Path to a runnable shim, preferring the bundled one. "" if none."""
-    for path in (BUNDLED_SHIM, LEGACY_SHIM):
-        if not os.path.exists(path):
-            continue
-        if not os.access(path, os.X_OK):
-            # A shim copied by hand (or unpacked from an archive) can lose its
-            # executable bit, and find_docker() skips anything not executable —
-            # so it would be silently ignored. Fix it rather than warn.
-            try:
-                os.chmod(path, os.stat(path).st_mode | 0o111)
-                logger.info("made shim executable: %s", path)
-            except OSError as e:
-                logger.warning("shim %s is not executable and chmod failed: %s", path, e)
-                continue
-        return path
-    return ""
+    """Path to the plugin's own shim, or "" if it is missing/unusable."""
+    if not os.path.exists(BUNDLED_SHIM):
+        return ""
+    if not os.access(BUNDLED_SHIM, os.X_OK):
+        # A file copied by hand (or unpacked from an archive) can lose its
+        # executable bit, and find_docker() skips anything not executable —
+        # so it would be silently ignored. Fix it rather than warn.
+        try:
+            os.chmod(BUNDLED_SHIM, os.stat(BUNDLED_SHIM).st_mode | 0o111)
+            logger.info("made shim executable: %s", BUNDLED_SHIM)
+        except OSError as e:
+            logger.warning(
+                "shim %s is not executable and chmod failed: %s", BUNDLED_SHIM, e
+            )
+            return ""
+    return BUNDLED_SHIM
 
 
 def _ensure_shim() -> None:
@@ -72,9 +72,10 @@ def _ensure_shim() -> None:
         logger.info("HERMES_DOCKER_BINARY -> %s", shim)
     else:
         logger.warning(
-            "Apple Container shim not found (looked in %s and %s) and "
+            "Apple Container shim missing from the plugin (%s) and "
             "HERMES_DOCKER_BINARY is unset — Hermes will fall back to PATH, "
-            "which cannot drive Apple Container.", BUNDLED_SHIM, LEGACY_SHIM,
+            "which cannot drive Apple Container. Reinstall the plugin.",
+            BUNDLED_SHIM,
         )
 
 

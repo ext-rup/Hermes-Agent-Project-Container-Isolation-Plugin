@@ -84,24 +84,21 @@ That is the whole install. The shim ships **inside** the plugin
 `HERMES_DOCKER_BINARY` at its own copy at load time — so there is no second
 step and no `~/.hermes/.env` edit.
 
-The installer copies the plugin into `~/.hermes/plugins/`, adds it to the
+The installer **copies** the plugin into `~/.hermes/plugins/`, adds it to the
 `plugins.enabled` allow-list, and restarts the gateway (required — the plugin
 loads into the gateway process).
 
+Everything installed is a real file under `~/.hermes/plugins/` — nothing is
+symlinked back into this checkout, so the install does not break if you move or
+delete the repo, and `ls -l` on the plugin directory shows exactly what is
+there. After editing anything here, re-run the installer to re-sync:
+
+```bash
+./install-plugins.sh apple
+```
+
 **Nothing on the system is replaced.** `/usr/local/bin/docker` and anything on
 `PATH` are left alone; `HERMES_DOCKER_BINARY` simply outranks them.
-
-<details>
-<summary>Optional: <code>./install.sh</code> — develop against the repo</summary>
-
-`install.sh` symlinks `~/.hermes/docker-wrapper` at this repo and writes
-`HERMES_DOCKER_BINARY` into `~/.hermes/.env`. Useful when hacking on the shim,
-since edits are live with no reinstall — the shim is a fresh process on every
-`docker` call. An explicit `HERMES_DOCKER_BINARY` always beats the plugin's
-bundled copy, so this cleanly overrides it.
-
-Not needed for a normal install.
-</details>
 
 ### Docker
 
@@ -119,13 +116,9 @@ and remove any fixed `:/workspace` entry from `terminal.docker_volumes` — a
 hardcoded host path there would be mounted for *every* project. The plugin logs
 a warning at startup if either is wrong.
 
-If you previously used the Apple backend, also clear the shim override, or
-Hermes will keep driving Apple Container:
-
-```bash
-# in ~/.hermes/.env — remove or comment out
-# HERMES_DOCKER_BINARY=/Users/you/.hermes/docker-wrapper
-```
+If you previously used the Apple backend and set `HERMES_DOCKER_BINARY` by
+hand, clear it — an explicit value outranks everything, so Hermes would keep
+driving Apple Container. The Docker plugin warns at startup if it spots one.
 
 ### Manual install (no scripts)
 
@@ -428,7 +421,7 @@ invocation for a shim to intercept, so no amount of shim work reaches it.
 `patches/per-project-task-id.py` scopes that return value by active project, so
 the cache keys per project and each project chat builds its own environment.
 It is idempotent, backs up the file, syntax-checks the result and restores on
-failure. `install.sh` runs it.
+failure. `install-plugins.sh` runs it.
 
 **Superseded by the plugin** — kept for reference and for anyone who prefers a
 `tools/terminal_tool.py`:

@@ -11,7 +11,10 @@ import sys
 import tempfile
 import unittest
 
-WRAPPER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docker-wrapper")
+WRAPPER_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "plugins", "hermes-projects-apple", "docker-wrapper",
+)
 spec = importlib.util.spec_from_loader(
     "docker_wrapper", importlib.machinery.SourceFileLoader("docker_wrapper", WRAPPER_PATH)
 )
