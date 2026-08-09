@@ -284,7 +284,27 @@ packages first — and those installs are lost whenever a container is recreated
 ```
 
 Adds `poppler-utils` (pdftotext, pdftoppm, pdfimages, pdfinfo), `ghostscript`,
-`pypdf`, `pdfplumber` and `Pillow`.
+`pypdf`, `pdfplumber`, `Pillow`, and for scanned documents `tesseract-ocr` +
+`ocrmypdf`.
+
+### OCR
+
+A scanned PDF has no text layer, so `pdftotext` returns nothing. `ocrmypdf`
+adds one:
+
+```bash
+ocrmypdf --language deu scan.pdf searchable.pdf
+pdftotext searchable.pdf -
+```
+
+Language data must be present **at build time** — `eng` and `deu` are included.
+Add more by extending the `tesseract-ocr-*` list in `image/Dockerfile` (Debian
+names follow ISO 639-2: `-fra`, `-spa`, `-nld`) and rebuilding.
+
+`build.sh` verifies OCR end to end rather than trusting version strings: it
+generates an image-only PDF, asserts `pdftotext` finds nothing, runs OCR, and
+fails the build unless the text comes back. That catches a missing language
+pack or a broken ghostscript path, which a `--version` check would not.
 
 Point Hermes at it in **both** places — `~/.hermes/.env` overrides
 `config.yaml`, so changing only the YAML has no effect:
