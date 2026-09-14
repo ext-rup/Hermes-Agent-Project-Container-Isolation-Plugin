@@ -86,12 +86,32 @@ def _install_mount_override() -> bool:
         logger.warning("could not import terminal_tool: %s", e)
         return False
 
-    original = getattr(terminal_tool, "_create_environment", None)
+    # Hermes 0.21+ (Sep 2026 refactor, PR #102117) moved _create_environment
+    # out of terminal_tool into tools.terminal_tool_backends.  Try the new
+    # home first, then fall back to the old attribute for older installs.
+    # We patch the *module that actually holds the function* so the wrapper
+    # is visible to every caller (terminal_tool_lifecycle imports it from
+    # there at call time, so patching terminal_tool itself no longer works).
+    target_mod = None
+    original = None
+    try:
+        from tools import terminal_tool_backends
+        original = getattr(terminal_tool_backends, "_create_environment", None)
+        if original is not None:
+            target_mod = terminal_tool_backends
+    except Exception:
+        pass
     if original is None:
+        original = getattr(terminal_tool, "_create_environment", None)
+        if original is not None:
+            target_mod = terminal_tool
+
+    if original is None or target_mod is None:
         logger.warning(
             "workspace mount override not installed: "
-            "terminal_tool._create_environment is missing (Hermes changed "
-            "upstream). Containers will still be per-project, but /workspace "
+            "_create_environment not found on terminal_tool or "
+            "terminal_tool_backends (Hermes changed upstream). "
+            "Containers will still be per-project, but /workspace "
             "may not follow."
         )
         return False
@@ -110,7 +130,7 @@ def _install_mount_override() -> bool:
 
     wrapped._hermes_containers_wrapped = True  # type: ignore[attr-defined]
     wrapped._hermes_containers_original = original  # type: ignore[attr-defined]
-    terminal_tool._create_environment = wrapped
+    target_mod._create_environment = wrapped
     return True
 
 

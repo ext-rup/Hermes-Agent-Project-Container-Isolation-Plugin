@@ -1,0 +1,7 @@
+name: hermes-apple-container
+version: 2.0.0
+description: "Apple Container terminal backend. Runs commands in Apple's lightweight container runtime with per-project isolation, workspace bind-mounts, and the same lifecycle as built-in backends."
+author: "Hermes Containers"
+kind: backend
+hooks:
+  - on_session_start

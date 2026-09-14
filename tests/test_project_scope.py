@@ -199,6 +199,27 @@ class TestInstall(ScopeTestBase):
         ps.install(mod)
         self.assertEqual(mod._resolve_container_task_id("s"), "benchmark-run-7")
 
+    def test_scopes_profile_key(self):
+        '"profile:work" is a shared key — must be scoped per project.'
+        make_dbs(self.home, [("p1", "alpha", self.alpha)], [("s", self.alpha)], "p1")
+        mod = self._module("profile:work")
+        self.assertTrue(ps.install(mod))
+        self.assertEqual(mod._resolve_container_task_id("s"), "profile:work.alpha")
+
+    def test_leaves_session_key_alone(self):
+        '"session:abc" is per-session isolation — must not be scoped.'
+        make_dbs(self.home, [("p1", "alpha", self.alpha)], [("s", self.alpha)], "p1")
+        mod = self._module("session:abc")
+        ps.install(mod)
+        self.assertEqual(mod._resolve_container_task_id("s"), "session:abc")
+
+    def test_leaves_shared_key_alone(self):
+        '"shared:team" is explicit opt-in sharing — must not be scoped.'
+        make_dbs(self.home, [("p1", "alpha", self.alpha)], [("s", self.alpha)], "p1")
+        mod = self._module("shared:team")
+        ps.install(mod)
+        self.assertEqual(mod._resolve_container_task_id("s"), "shared:team")
+
     def test_install_is_idempotent(self):
         mod = self._module("default")
         self.assertTrue(ps.install(mod))

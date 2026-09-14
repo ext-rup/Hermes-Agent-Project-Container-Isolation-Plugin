@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.bak
 plugins/*/project_scope.py
+.DS_Store

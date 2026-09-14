@@ -447,7 +447,8 @@ def install(terminal_tool) -> bool:
 
     Wrapping rather than replacing means Hermes' own logic still runs first —
     including the RL/benchmark isolation-key branch, which must keep returning
-    its raw task_id untouched. Only the "default" outcome gets scoped, so an
+    its raw task_id untouched. Shared return values ("default", "profile:<name>")
+    get scoped; per-session and explicit-shared values are left alone, so an
     upstream change to the isolation rules is inherited automatically instead
     of being silently overridden.
 
@@ -466,9 +467,14 @@ def install(terminal_tool) -> bool:
 
     def wrapped(task_id=None):
         base = original(task_id)
-        # Anything but "default" is an isolation-keyed task (RL/benchmark
-        # rollouts) that already has its own sandbox — leave it alone.
-        if base != "default":
+        # Per-session isolation keys ("session:…", "shared:…") and raw
+        # isolation-override ids already have their own sandbox — leave
+        # them alone.  "default" and "profile:<name>" are *shared* keys
+        # that collapse every project onto one container, so scope them
+        # by project to partition the cache.
+        if base != "default" and not (
+            isinstance(base, str) and base.startswith("profile:")
+        ):
             return base
         try:
             return scoped_task_id(task_id, base)
