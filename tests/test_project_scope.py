@@ -67,6 +67,7 @@ class ScopeTestBase(unittest.TestCase):
         ps._cache.clear()
         ps._folders_cache.clear()
         ps._bindings.clear()
+        ps._original_resolver = None
         self.alpha = os.path.join(self.home, "Alpha")
         self.selling = os.path.join(self.alpha, "nested", "Subproject")
         self.beta = os.path.join(self.home, "Beta")
@@ -78,6 +79,7 @@ class ScopeTestBase(unittest.TestCase):
         ps._cache.clear()
         ps._folders_cache.clear()
         ps._bindings.clear()
+        ps._original_resolver = None
 
 
 class TestSessionResolution(ScopeTestBase):
@@ -199,12 +201,49 @@ class TestInstall(ScopeTestBase):
         ps.install(mod)
         self.assertEqual(mod._resolve_container_task_id("s"), "benchmark-run-7")
 
-    def test_scopes_profile_key(self):
-        '"profile:work" is a shared key — must be scoped per project.'
-        make_dbs(self.home, [("p1", "alpha", self.alpha)], [("s", self.alpha)], "p1")
+    def test_scopes_profile_key_from_the_profiles_own_home(self):
+        """'profile:work' must resolve against work's DBs, not the process home's.
+
+        The process may be homed to the default profile while serving another
+        profile's sessions. The project was created in profile work, so a
+        session under base 'profile:work' must find it in
+        <root>/profiles/work/projects.db — never in the default home.
+        """
+        root = self.home  # process homed to the DEFAULT profile
+        work_home = os.path.join(root, "profiles", "work")
+        os.makedirs(work_home, exist_ok=True)
+        # The *default* profile has its own active project that must NOT win.
+        make_dbs(root, [("p1", "alpha", self.alpha)], [], active_id="p1")
+        # Profile work has its project and the session's cwd.
+        work_alpha = os.path.join(work_home, "Alpha")
+        os.makedirs(work_alpha, exist_ok=True)
+        make_dbs(
+            work_home,
+            [("w1", "gamma", work_alpha)],
+            [("s", work_alpha)],
+            active_id="w1",
+        )
         mod = self._module("profile:work")
         self.assertTrue(ps.install(mod))
-        self.assertEqual(mod._resolve_container_task_id("s"), "profile:work.alpha")
+        self.assertEqual(mod._resolve_container_task_id("s"), "profile:work.gamma")
+
+    def test_profile_with_no_active_project_does_not_leak_defaults(self):
+        """Regression for the reported bug: a fresh profile session mounted the
+        default profile's folder at /workspace.
+
+        The default home has an active project; profile 'work' has projects but
+        none active and no recorded cwd. Resolving base 'profile:work' must
+        yield no project (scope stays 'profile:work') instead of guessing with
+        the default profile's active_id.
+        """
+        root = self.home
+        make_dbs(root, [("p1", "alpha", self.alpha)], [], active_id="p1")
+        work_home = os.path.join(root, "profiles", "work")
+        os.makedirs(work_home, exist_ok=True)
+        make_dbs(work_home, [("w1", "gamma", os.path.join(work_home, "Gamma"))], [])
+        mod = self._module("profile:work")
+        self.assertTrue(ps.install(mod))
+        self.assertEqual(mod._resolve_container_task_id("no-such-session"), "profile:work")
 
     def test_leaves_session_key_alone(self):
         '"session:abc" is per-session isolation — must not be scoped.'

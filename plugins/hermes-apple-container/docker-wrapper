@@ -64,6 +64,66 @@ DEBUG = os.environ.get("HERMES_WRAPPER_DEBUG") == "1"
 _LABEL_SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
 TASK_LABEL = "hermes-task-id"
 
+
+def hermes_root() -> str:
+    """The root dir containing per-profile homes, or the process home itself.
+
+    The process running Hermes may be homed to the default profile while the
+    sessions it serves belong to another profile (the launchd gateway is a
+    supervised child and ignores the sticky active_profile). The container key
+    carries the profile instead ("default" vs "profile:<name>"), so per-profile
+    DB reads are anchored here and never trust the process-wide HERMES_HOME
+    alone.
+    """
+    parent = os.path.dirname(HERMES_HOME)
+    if os.path.basename(parent) == "profiles":
+        return os.path.dirname(parent)
+    return HERMES_HOME
+
+
+def scoped_profile(task_id):
+    """The profile named by a (possibly scoped) container task id, or None.
+
+    "profile:work" and "profile:work.alpha" both yield "work"; "default",
+    "default.alpha" and raw session ids yield None (the root home).
+
+    Hermes sanitizes label values with ``_sanitize_label_value()`` before
+    emitting ``--label hermes-task-id=…`` (tools/environments/docker.py), which
+    turns the ":" of "profile:work" into "_". Profile names are already
+    label-safe (``[a-z0-9][a-z0-9_-]{0,63}``), so the sanitized "profile_work"
+    form is unambiguously the same profile — both spellings are accepted.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    base = task_id.partition(".")[0]
+    if base.startswith("profile:"):
+        return base.split(":", 1)[1].strip() or None
+    if base.startswith("profile_"):
+        name = base[len("profile_"):].strip()
+        return name or None
+    return None
+
+
+def profile_db_path(profile):
+    """projects.db of *profile* under the shared root, or None for the root home."""
+    if not profile or profile == "default":
+        return None
+    return os.path.join(hermes_root(), "profiles", profile, "projects.db")
+
+
+def _db_for_profile(profile) -> str:
+    """DB to read for a label's profile: the profile's own, or the process home's.
+
+    Returns "" when the label names a profile this root does not have a DB for
+    — callers must then pass through rather than substitute another profile's
+    (or the default profile's) DB, which is exactly the cross-profile leak this
+    guards against.
+    """
+    db = profile_db_path(profile)
+    if db is not None:
+        return db if os.path.exists(db) else ""
+    return PROJECTS_DB
+
 # Apple Container has no equivalent; drop the flag and its value.
 STRIP_WITH_VALUE = frozenset({
     "--security-opt", "--restart", "--add-host", "--pids-limit", "--storage-opt",
@@ -266,10 +326,17 @@ def split_scoped(task_id, slugs=None):
     session, while the shim can only see the global active project, and when
     the two disagree the label gets scoped twice ("default.alpha.beta")
     and the session is routed to another project's container.
+
+    Slug membership is answered from the label's OWN profile DB (a
+    "profile:work.alpha" label is checked against
+    <root>/profiles/work/projects.db), so a slug that only exists in another
+    profile is never mistaken for this one.
     """
     if not task_id or "." not in task_id:
         return task_id, None
-    slugs = known_slugs() if slugs is None else slugs
+    if slugs is None:
+        db = _db_for_profile(scoped_profile(task_id))
+        slugs = known_slugs(db) if db else frozenset()
     base, _, suffix = task_id.rpartition(".")
     if suffix in slugs:
         return base, suffix
@@ -715,6 +782,26 @@ def split_volume(spec):
     return match.group(1), match.group(2), match.group(3)
 
 
+def _profile_sandbox_rewrite(src, profile):
+    """Move a Hermes-owned sandbox mount under *profile*'s own home.
+
+    Hermes creates /workspace and /root sandboxes under the PROCESS home's
+    sandboxes/. When that process is homed to the default profile but serves
+    another profile's container, the raw mounts would point into the default
+    profile's home — so relocate any source under ``<root>/sandboxes/`` to
+    ``<root>/profiles/<name>/sandboxes/``. Project directories (the /workspace
+    repoint target) are user paths and never match the marker.
+    """
+    if not profile:
+        return src
+    root = os.path.abspath(hermes_root())
+    marker = os.path.join(root, "sandboxes") + os.sep
+    norm = os.path.abspath(src)
+    if norm.startswith(marker):
+        return os.path.join(root, "profiles", profile, "sandboxes", norm[len(marker):])
+    return src
+
+
 def rewrite_run_args(args, slug, project_path, config, already_scoped=False):
     """Repoint the workspace/home mounts, and scope the task-id label.
 
@@ -727,6 +814,17 @@ def rewrite_run_args(args, slug, project_path, config, already_scoped=False):
     notes = []
     if not slug:
         return args, notes
+
+    # The label names the container's profile; Hermes-owned sandbox mounts are
+    # relocated under that profile's home below.
+    label_profile = None
+    for i, arg in enumerate(args):
+        if arg == "--label" and i + 1 < len(args):
+            key, sep, val = args[i + 1].partition("=")
+            if key == TASK_LABEL and sep:
+                label_profile = scoped_profile(val)
+                break
+            break
 
     out = []
     i = 0
@@ -756,7 +854,9 @@ def rewrite_run_args(args, slug, project_path, config, already_scoped=False):
 
         # --- volumes ---
         if arg in ("-v", "--volume") and i + 1 < len(args):
-            new_spec, note = _rewrite_volume(args[i + 1], slug, project_path, config)
+            new_spec, note = _rewrite_volume(
+                args[i + 1], slug, project_path, config, label_profile
+            )
             if note:
                 notes.append(note)
             if new_spec is not None:
@@ -765,7 +865,7 @@ def rewrite_run_args(args, slug, project_path, config, already_scoped=False):
             continue
         if arg.startswith(("-v=", "--volume=")):
             new_spec, note = _rewrite_volume(
-                arg.split("=", 1)[1], slug, project_path, config
+                arg.split("=", 1)[1], slug, project_path, config, label_profile
             )
             if note:
                 notes.append(note)
@@ -784,7 +884,30 @@ def rewrite_run_args(args, slug, project_path, config, already_scoped=False):
     return out, notes
 
 
-def _rewrite_volume(spec, slug, project_path, config):
+def _rewrite_volume(spec, slug, project_path, config, profile=None):
+    """Repoint one volume. Returns (new_spec_or_None, note).
+
+    Runs the project repoints (_rewrite_volume_inner), then relocates any
+    surviving Hermes-owned sandbox mount (workspace/home under
+    ``<root>/sandboxes/``) into the label's profile home.
+    """
+    new_spec, note = _rewrite_volume_inner(spec, slug, project_path, config)
+    if new_spec is None:
+        return None, note
+    if not profile:
+        return new_spec, note
+    src, dst, opts = split_volume(new_spec)
+    if src is None or dst not in ("/workspace", "/root"):
+        return new_spec, note
+    relocated = _profile_sandbox_rewrite(src, profile)
+    if relocated == src:
+        return new_spec, note
+    rebuilt = relocated + ":" + dst + (":" + opts if opts else "")
+    combined = note + f"; {dst} -> {relocated}" if note else f"{dst} -> {relocated}"
+    return rebuilt, combined
+
+
+def _rewrite_volume_inner(spec, slug, project_path, config):
     """Repoint one volume. Returns (new_spec_or_None, note)."""
     src, dst, opts = split_volume(spec)
     if src is None:
@@ -865,29 +988,49 @@ def _project_for_run(args, config):
     active project. Using the label keeps concurrent sessions correct and
     prevents the two from disagreeing and double-scoping.
 
+    Every lookup honours the label's profile: a "profile:work" label (scoped
+    or not) reads <root>/profiles/work/projects.db — for the slug split, for
+    the project path, and for the active-project fallback. A profile label
+    whose DB is missing passes through instead of resolving against — and
+    mounting — the default profile's projects.
+
     Returns ``(slug, path, already_scoped)``.
     """
     if not config.get("per_project", True):
         return None, None, False
 
-    slugs = known_slugs()
+    label = None
     for i, arg in enumerate(args):
         if arg == "--label" and i + 1 < len(args):
             key, sep, val = args[i + 1].partition("=")
             if key == TASK_LABEL and sep:
-                # Shared containers (the backend probe) must not receive any
-                # project's directory: one container is reused by every
-                # project, so mounting the active project's files there would
-                # expose them to all of the others. Claim no project at all.
-                if val in UNSCOPED_TASK_IDS:
-                    return None, None, False
-                _, slug = split_scoped(val, slugs)
-                if slug:
-                    return slug, project_path_for_slug(slug), True
+                label = val
                 break
 
-    # No project in the label — the plugin isn't installed (or this is the
-    # shared backend probe). Fall back to the globally active project.
+    # A label present but unrecognised falls through to the fallback below
+    # (label is None when there is no task label at all).
+    if label is not None:
+        # Shared containers (the backend probe) must not receive any
+        # project's directory: one container is reused by every project, so
+        # mounting the active project's files there would expose them to all
+        # of the others. Claim no project at all.
+        if label in UNSCOPED_TASK_IDS:
+            return None, None, False
+        db = _db_for_profile(scoped_profile(label))
+        if not db:
+            # A profile label whose DB this root does not have — never guess
+            # with another profile's (or the default profile's) store.
+            return None, None, False
+        _, slug = split_scoped(label, known_slugs(db))
+        if slug:
+            return slug, project_path_for_slug(slug, db), True
+        # Plugin not installed (or an unscoped shared label): fall back to the
+        # active project of the label's OWN home.
+        slug, path = active_project(db)
+        return slug, path, False
+
+    # No task label at all — fall back to the globally active project of the
+    # process home.
     slug, path = active_project()
     return slug, path, False
 

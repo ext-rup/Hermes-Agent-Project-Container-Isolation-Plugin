@@ -396,12 +396,49 @@ active at that instant and share a container.
 
 **Known gap.** Hermes writes `sessions.cwd` only after a terminal command
 settles, and `origin_json`/`git_repo_root` are empty too, so a session's *first*
-call has no per-session signal at all and falls back to the global active
-project. That is normally right — the active project is the chat you just
-opened — but two *brand-new* sessions in different projects making their first
-call at the same time will both bind to whichever is active. There is no
+call has no per-session signal at all and falls back to the active project of
+its own profile. That is normally right — the active project is the chat you
+just opened — but two *brand-new* sessions in different projects making their
+first call at the same time will both bind to whichever is active. There is no
 information available at that moment to tell them apart. Established sessions
 are unaffected. The `via global active_id` log line marks every occurrence.
+
+## Profiles
+
+Hermes runs one gateway per profile, and every profile has its own home
+(`~/.hermes` for the default profile, `~/.hermes/profiles/<name>` otherwise) —
+own `projects.db`, own `state.db`, own `plugins/`. Three things follow:
+
+1. **Install the plugin into every profile that should get per-project
+   containers.** Plugins load from the profile's own `plugins/` directory, so
+   installing only into `~/.hermes/plugins` leaves other profiles with no
+   scoping (and, with the Apple backend, no `apple_container` provider):
+
+   ```bash
+   HERMES_PLUGIN_DIR=~/.hermes/profiles/work/plugins \
+   HERMES_CONFIG=~/.hermes/profiles/work/config.yaml \
+   ./install-plugins.sh apple
+   ```
+
+2. **Resolution is keyed by the session's own container key, not by the
+   process home.** The gateway that serves a session may be homed to the
+   default profile even while the session belongs to another profile (the
+   launchd gateway is a supervised child and ignores the sticky
+   `active_profile` by design, and legacy setups end up served from there).
+   Both the plugin and the shim therefore derive the home from the key
+   (`default` vs `profile:<name>`) and read THAT profile's `projects.db` /
+   `state.db`: a `profile:work` session resolves work's own projects, work's
+   own active project, and mounts work's directories. A profile key whose
+   home has no database — or no active project — passes through rather than
+   falling back to the default profile's active project. That fallback is
+   what could previously mount the *default profile's* folder at `/workspace`
+   for a session in another profile.
+
+3. **Sandbox state is kept per profile.** When a container belongs to a
+   profile, the shim relocates Hermes' `/workspace` and `/root` sandbox
+   mounts from `<root>/sandboxes/…` into
+   `<root>/profiles/<name>/sandboxes/…`, so a profile session never writes
+   its container state into — or mounts — the default profile's home.
 
 The wrapper calls Hermes' original function first and only scopes a `"default"`
 result, so RL/benchmark isolation ids pass through untouched and upstream

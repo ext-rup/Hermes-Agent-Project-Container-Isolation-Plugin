@@ -35,6 +35,19 @@ container.
 Longest-prefix matching is deliberate: with folders ``…/Alpha`` and
 ``…/Alpha/nested/Subproject`` registered as separate projects, a
 session inside the latter must resolve to ``subproject``, not ``alpha``.
+
+Profiles
+--------
+Hermes keys containers ``default`` (root home) or ``profile:<name>``. The
+process running the gateway may be homed to the default profile even while it
+serves another profile's sessions (the launchd gateway is a supervised child
+and deliberately ignores the sticky ``active_profile``), so resolution NEVER
+trusts the process-wide ``$HERMES_HOME`` alone: every DB read is scoped by the
+session's own base key. A ``profile:<name>`` session reads that profile's
+``state.db``/``projects.db`` — its cwd, its project folders, its *active*
+project — and yields None instead of guessing with the default profile's
+active project. Otherwise a profile session would resolve (and mount, via the
+shim) a folder belonging to the default profile.
 """
 
 from __future__ import annotations
@@ -138,6 +151,56 @@ def _hermes_home() -> str:
     return os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
 
 
+def _hermes_root() -> str:
+    """The root that contains per-profile homes, or the process home itself.
+
+    ``$HERMES_HOME`` resolves to exactly one home per process; the gateway
+    that serves a session may be homed to the *default* profile even when the
+    session belongs to another profile (the launchd gateway is a supervised
+    child and deliberately ignores the sticky ``active_profile``). The profile
+    is carried in the container key instead (``default`` vs ``profile:<name>``)
+    — so derive the per-profile home from *that*, never only from the
+    process-wide env var.
+    """
+    home = _hermes_home()
+    parent = os.path.dirname(home)
+    if os.path.basename(parent) == "profiles":
+        return os.path.dirname(parent)
+    return home
+
+
+def _profile_of_base(base) -> Optional[str]:
+    """The profile named by a container base key, or None.
+
+    ``"default"``/None mean the root home; ``"profile:work"`` means
+    ``<root>/profiles/work`` regardless of which home this process runs under.
+    """
+    if isinstance(base, str) and base.startswith("profile:"):
+        name = base.split(":", 1)[1].strip()
+        return name or None
+    return None
+
+
+def _home_for_profile(profile: Optional[str]) -> Optional[str]:
+    """Home dir of *profile* (``<root>/profiles/<name>``), or None (root home)."""
+    if not profile or profile == "default":
+        return None
+    return os.path.join(_hermes_root(), "profiles", profile)
+
+
+def _db_path(kind: str, base) -> str:
+    """``<kind>.db`` from the home the *base* key belongs to.
+
+    A ``profile:<name>`` base reads that profile's DB even when this process
+    is homed elsewhere; anything else reads the process home (unchanged
+    behaviour). This is what keeps a profile session from ever resolving
+    against — or worse, mounting — the default profile's project folders.
+    """
+    profile = _profile_of_base(base)
+    home = _home_for_profile(profile) or _hermes_home()
+    return os.path.join(home, kind + ".db")
+
+
 def _connect_ro(db_path: str) -> Optional[sqlite3.Connection]:
     """Open *db_path* for reading, or return None.
 
@@ -164,14 +227,18 @@ def sanitize(value: str) -> str:
     return _LABEL_SAFE_RE.sub("_", str(value))[:40]
 
 
-def _session_cwd(task_id: str) -> Optional[str]:
+def _session_cwd(task_id: str, base=None) -> Optional[str]:
     """Host cwd recorded for *task_id*, or None.
 
     ``sessions.id`` uses the same value the terminal tool receives as
     ``task_id`` (e.g. ``20260807_105303_df4fdd``). ``session_key`` is checked
     too since gateway sessions are registered under it.
+
+    The DB read follows *base*: a ``profile:<name>`` session reads that
+    profile's ``state.db`` — a session's cwd lives in its own profile, not in
+    whichever home this process happens to run under.
     """
-    conn = _connect_ro(os.path.join(_hermes_home(), "state.db"))
+    conn = _connect_ro(_db_path("state", base))
     if conn is None:
         return None
     try:
@@ -198,17 +265,22 @@ def _session_cwd(task_id: str) -> Optional[str]:
     return os.path.abspath(os.path.expanduser(str(row[0])))
 
 
-def _project_folders():
-    """[(slug, abspath, realpath)], cached against projects.db's mtime+size."""
-    db = os.path.join(_hermes_home(), "projects.db")
+def _project_folders(base=None):
+    """[(slug, abspath, realpath)], cached against the owning DB's mtime+size.
+
+    The DB follows *base* (see ``_db_path``), so a ``profile:<name>`` session
+    matches only its own profile's project folders.
+    """
+    db = _db_path("projects", base)
     try:
         st = os.stat(db)
         stamp = (db, st.st_mtime_ns, st.st_size)
     except OSError:
         return []
 
+    cache_key = "v" + (base or "")
     with _folders_lock:
-        hit = _folders_cache.get("v")
+        hit = _folders_cache.get(cache_key)
         if hit and hit[0] == stamp:
             return hit[1]
 
@@ -243,7 +315,7 @@ def _project_folders():
         folders.append((slug, root, real))
 
     with _folders_lock:
-        _folders_cache["v"] = (stamp, folders)
+        _folders_cache[cache_key] = (stamp, folders)
     return folders
 
 
@@ -251,13 +323,14 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def _project_for_path(path: str) -> Optional[str]:
+def _project_for_path(path: str, base=None) -> Optional[str]:
     """Slug of the project owning *path*, by longest-prefix match.
 
     Longest wins so a project nested inside another (…/Alpha/…/Subproject
-    within …/Alpha) resolves to the inner one.
+    within …/Alpha) resolves to the inner one. The folder list follows *base*,
+    so a profile session never matches the default profile's projects.
     """
-    folders = _project_folders()
+    folders = _project_folders(base)
     if not folders:
         return None
     try:
@@ -278,8 +351,8 @@ def _project_for_path(path: str) -> Optional[str]:
     return best_slug
 
 
-def _active_project_slug() -> Optional[str]:
-    conn = _connect_ro(os.path.join(_hermes_home(), "projects.db"))
+def _active_project_slug(base=None) -> Optional[str]:
+    conn = _connect_ro(_db_path("projects", base))
     if conn is None:
         return None
     try:
@@ -301,6 +374,11 @@ def _active_project_slug() -> Optional[str]:
 # is the only per-session discriminator available, and without it concurrent
 # projects would collapse onto the global active_id and share a container.
 _current = threading.local()
+
+# The unwrapped upstream resolver, set by install(). project_path_for_task
+# consults it to learn a session's base key ("default" / "profile:<name>")
+# without reimplementing Hermes' isolation rules.
+_original_resolver = None
 
 
 def note_ids(task_id: Optional[str], session_id: Optional[str]) -> None:
@@ -325,14 +403,21 @@ def _candidate_ids(task_id: Optional[str]):
     return out
 
 
-def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
+def resolve_project_slug(task_id: Optional[str], base=None) -> Tuple[Optional[str], str]:
     """Return ``(slug, source)`` for *task_id*. ``slug`` is None if unknown.
+
+    ``base`` is the container key Hermes resolved for this session
+    (``"default"`` or ``profile:<name>``). It selects whose DBs are read: a
+    ``profile:<name>`` session resolves against that profile's ``state.db``
+    and ``projects.db``, never the process home's — a session in another
+    profile must not be able to resolve (or mount) the default profile's
+    active project. ``None`` keeps the historical process-home behaviour.
 
     ``source`` is "session", "active" or "none" — reported so the reason a
     container was chosen is visible in the logs.
     """
     candidates = _candidate_ids(task_id)
-    key = "|".join(candidates)
+    key = "|".join(candidates) + "::" + (base or "")
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
@@ -351,10 +436,10 @@ def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
     #    lets a session that had to guess correct itself once Hermes records a
     #    cwd for it.
     for cand in candidates:
-        cwd = _session_cwd(cand)
+        cwd = _session_cwd(cand, base)
         if not cwd:
             continue
-        found = _project_for_path(cwd)
+        found = _project_for_path(cwd, base)
         if found:
             slug, source = found, "session"
             break
@@ -368,8 +453,12 @@ def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
 
     # 3. Nothing session-specific exists yet: guess the active project and
     #    remember it, so the guess is made once rather than re-rolled per call.
+    #    The active project comes from the SAME home as the base key — for a
+    #    profile session that is the profile's own DB, so a fresh profile with
+    #    no active project yields None instead of leaking the default
+    #    profile's active project into the mount decision.
     if slug is None:
-        found = _active_project_slug()
+        found = _active_project_slug(base)
         if found:
             slug, source = found, "active"
 
@@ -384,17 +473,26 @@ def resolve_project_slug(task_id: Optional[str]) -> Tuple[Optional[str], str]:
     return slug, source
 
 
-def project_path_for_task(task_id: Optional[str]) -> Optional[str]:
+def project_path_for_task(task_id: Optional[str], base=None) -> Optional[str]:
     """Primary directory of the project owning *task_id*, or None.
 
     Used by the Docker plugin to make the ``/workspace`` bind mount follow the
     project. The Apple Container variant does not need this — its shim rewrites
     the mount at ``docker run`` time.
+
+    *base* is the session's container key; when omitted it is derived from the
+    wrapped ``_resolve_container_task_id`` so a profile session reads the
+    profile's own projects.db.
     """
-    slug, _ = resolve_project_slug(task_id)
+    if base is None and _original_resolver is not None:
+        try:
+            base = _original_resolver(task_id)
+        except Exception:
+            base = None
+    slug, _ = resolve_project_slug(task_id, base)
     if not slug:
         return None
-    conn = _connect_ro(os.path.join(_hermes_home(), "projects.db"))
+    conn = _connect_ro(_db_path("projects", base))
     if conn is None:
         return None
     try:
@@ -421,24 +519,33 @@ def scoped_task_id(task_id: Optional[str], base: str) -> str:
 
     Idempotent, so an already-scoped value passed back in is unchanged.
     """
-    slug, source = resolve_project_slug(task_id)
+    slug, source = resolve_project_slug(task_id, base)
     if not slug:
         return base
     slug = sanitize(slug)
     if base.endswith("." + slug):
         return base
     scoped = f"{base}.{slug}"
+    profile = _profile_of_base(base)
     if source == "active":
-        # Fell back to the global active project. Correct for a single session,
-        # but concurrent sessions in different projects would both land here
-        # and share a container — so say so rather than fail quietly.
+        # Fell back to the active project of the base's home. Correct for a
+        # single session, but concurrent sessions in different projects would
+        # both land here and share a container — so say so rather than fail
+        # quietly.
         logger.info(
-            "project scope: task_id=%r -> %s via global active_id "
+            "project scope: task_id=%r %s-> %s via global active_id "
             "(no session cwd found; concurrent projects may collide)",
-            task_id, scoped,
+            task_id,
+            f"(profile {profile}) " if profile else "",
+            scoped,
         )
     else:
-        logger.info("project scope: task_id=%r -> %s via %s", task_id, scoped, source)
+        logger.info(
+            "project scope: task_id=%r %s-> %s via %s",
+            task_id,
+            f"(profile {profile}) " if profile else "",
+            scoped, source,
+        )
     return scoped
 
 
@@ -464,6 +571,8 @@ def install(terminal_tool) -> bool:
         return False
     if getattr(original, "_hermes_containers_wrapped", False):
         return True
+    global _original_resolver
+    _original_resolver = original
 
     def wrapped(task_id=None):
         base = original(task_id)

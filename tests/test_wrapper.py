@@ -377,6 +377,115 @@ class TestRunRewriting(unittest.TestCase):
         self.assertEqual(out[-3:], ["node:24-bookworm-slim", "sleep", "infinity"])
 
 
+class TestProfileScoping(unittest.TestCase):
+    """A profile session must resolve against the profile's own DBs — never the
+    process home's. Regression for the reported bug: a session in a non-default
+    profile mounted the DEFAULT profile's folder at /workspace."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = os.path.join(self.tmp, "root")
+        os.makedirs(self.root, exist_ok=True)
+        self.root_db = os.path.join(self.root, "projects.db")
+        self.work_db = os.path.join(self.root, "profiles", "work", "projects.db")
+        self.work_alpha = os.path.join(self.root, "profiles", "work", "Alpha")
+        os.makedirs(self.work_alpha, exist_ok=True)
+        self._saved = (dw.HERMES_HOME, dw.PROJECTS_DB, dw.SANDBOX_ROOT)
+        # The process is homed to the DEFAULT profile (root), not to work.
+        dw.HERMES_HOME = self.root
+        dw.PROJECTS_DB = self.root_db
+        dw.SANDBOX_ROOT = os.path.join(self.root, "sandboxes", "docker")
+        os.environ.pop("HERMES_PROJECT_SLUG", None)
+
+    def tearDown(self):
+        dw.HERMES_HOME, dw.PROJECTS_DB, dw.SANDBOX_ROOT = self._saved
+        os.environ.pop("HERMES_PROJECT_SLUG", None)
+
+    def test_scoped_profile(self):
+        self.assertEqual(dw.scoped_profile("profile:work.alpha"), "work")
+        self.assertEqual(dw.scoped_profile("profile:work"), "work")
+        # Hermes' _sanitize_label_value() rewrites ":" -> "_" on emitted labels.
+        self.assertEqual(dw.scoped_profile("profile_work.gamma"), "work")
+        self.assertEqual(dw.scoped_profile("profile_work"), "work")
+        self.assertIsNone(dw.scoped_profile("default.alpha"))
+        self.assertIsNone(dw.scoped_profile("default"))
+        self.assertIsNone(dw.scoped_profile("20260915_abc123"))
+
+    def test_profile_db_selection(self):
+        make_projects_db(self.work_db, [("w1", "gamma", "Gamma", self.work_alpha)],
+                         active_id="w1")
+        self.assertEqual(dw._db_for_profile("work"), self.work_db)
+        self.assertEqual(dw._db_for_profile(None), self.root_db)
+        # A profile with no DB on this root passes through — never substituted
+        # with another profile's store.
+        self.assertEqual(dw._db_for_profile("ghost"), "")
+
+    def test_run_resolves_scoped_label_from_profiles_db(self):
+        """The label carries the project AND the profile; the root's own active
+        project must not win. Exercises both the raw key (in gateway memory)
+        and the sanitized label Hermes actually emits."""
+        make_projects_db(self.root_db, [("p1", "alpha", "Alpha", "/tmp/alpha")],
+                         active_id="p1")
+        make_projects_db(self.work_db, [("w1", "gamma", "Gamma", self.work_alpha)],
+                         active_id="w1")
+        for label in ("profile:work.gamma", "profile_work.gamma"):
+            args = ["-d", "--label", f"hermes-task-id={label}",
+                    "-v", "/sandbox/workspace:/workspace"]
+            slug, path, already = dw._project_for_run(args, dict(dw.DEFAULT_CONFIG))
+            self.assertEqual((slug, path, already), ("gamma", self.work_alpha, True))
+            out, _ = dw.rewrite_run_args(args, slug, path, dw.DEFAULT_CONFIG,
+                                         already_scoped=already)
+            self.assertIn(f"{self.work_alpha}:/workspace", out)
+
+    def test_pluginless_profile_label_falls_back_to_profiles_active(self):
+        """Unscoped 'profile:work' (no plugin) still reads WORK's active project,
+        never the process home's."""
+        make_projects_db(self.root_db, [("p1", "alpha", "Alpha", "/tmp/alpha")],
+                         active_id="p1")
+        make_projects_db(self.work_db, [("w1", "gamma", "Gamma", self.work_alpha)],
+                         active_id="w1")
+        args = ["-d", "--label", "hermes-task-id=profile_work", "-v", "/x:/workspace"]
+        slug, path, already = dw._project_for_run(args, dict(dw.DEFAULT_CONFIG))
+        self.assertEqual((slug, path, already), ("gamma", self.work_alpha, False))
+
+    def test_profile_with_no_active_never_mounts_defaults_folder(self):
+        """The reported bug: the default profile has an active project, work has
+        none. A work container must NOT receive the default profile's folder."""
+        make_projects_db(self.root_db, [("p1", "alpha", "Alpha", "/tmp/alpha")],
+                         active_id="p1")
+        make_projects_db(self.work_db, [("w1", "gamma", "Gamma", self.work_alpha)])
+        args = ["-d", "--label", "hermes-task-id=profile_work", "-v", "/x:/workspace"]
+        slug, path, already = dw._project_for_run(args, dict(dw.DEFAULT_CONFIG))
+        self.assertIsNone(slug)
+        self.assertFalse(already)
+
+    def test_unknown_profile_passes_through(self):
+        make_projects_db(self.root_db, [("p1", "alpha", "Alpha", "/tmp/alpha")],
+                         active_id="p1")
+        args = ["-d", "--label", "hermes-task-id=profile_ghost", "-v", "/x:/workspace"]
+        slug, path, already = dw._project_for_run(args, dict(dw.DEFAULT_CONFIG))
+        self.assertIsNone(slug)
+        self.assertFalse(already)
+
+    def test_sandbox_mounts_relocate_to_profile_home(self):
+        """A root-homed process serving a profile container must not write the
+        container's /root state into the default profile's sandbox."""
+        make_projects_db(self.root_db, [("p1", "alpha", "Alpha", "/tmp/alpha")],
+                         active_id="p1")
+        make_projects_db(self.work_db, [("w1", "gamma", "Gamma", self.work_alpha)],
+                         active_id="w1")
+        home = os.path.join(dw.SANDBOX_ROOT, "default", "home")
+        args = ["-d", "--label", "hermes-task-id=profile_work",
+                "-v", f"{home}:/root", "-v", "/sandbox/ws:/workspace"]
+        out, _ = dw.rewrite_run_args(args, "gamma", None, dw.DEFAULT_CONFIG)
+        joined = " ".join(out)
+        relocated = os.path.join(
+            self.root, "profiles", "work", "sandboxes", "docker", "default.gamma", "home"
+        )
+        self.assertIn(f"{relocated}:/root", joined)
+        self.assertNotIn(f"{home}:/root", joined)
+
+
 class TestTranslate(unittest.TestCase):
     def test_exec_keeps_interactive_and_tty(self):
         """Apple Container's exec does support -i/-t."""
