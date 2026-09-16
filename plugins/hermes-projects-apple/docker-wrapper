@@ -85,7 +85,8 @@ def scoped_profile(task_id):
     """The profile named by a (possibly scoped) container task id, or None.
 
     "profile:work" and "profile:work.alpha" both yield "work"; "default",
-    "default.alpha" and raw session ids yield None (the root home).
+    "default.alpha", "session:…"/"session_…" keys and raw session ids yield
+    None (the root home).
 
     Hermes sanitizes label values with ``_sanitize_label_value()`` before
     emitting ``--label hermes-task-id=…`` (tools/environments/docker.py), which

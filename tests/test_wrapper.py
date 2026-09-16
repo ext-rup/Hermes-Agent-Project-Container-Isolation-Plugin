@@ -278,6 +278,66 @@ class TestAlreadyScoped(unittest.TestCase):
         self.assertEqual(filters["_labels"]["hermes-task-id"], "default.beta")
 
 
+class TestSessionKeyScoping(unittest.TestCase):
+    """Regression: the apple_container backend gets a "session:…" key from
+    _resolve_container_task_id (docker_profile_scoped is docker-only), which
+    the plugin must scope by project so the shim can repoint /workspace.
+
+    Hermes sanitizes the ":" to "_" in the label, so the shim sees
+    "session_abc.alpha", not "session:abc.alpha".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "projects.db")
+        self.project = os.path.join(self.tmp, "Alpha")
+        os.makedirs(self.project)
+        make_projects_db(
+            self.db,
+            [("p1", "alpha", "Alpha", self.project),
+             ("p2", "beta", "Beta", "/tmp/beta")],
+            active_id="p2",
+        )
+        self._orig_db = dw.PROJECTS_DB
+        dw.PROJECTS_DB = self.db
+
+    def tearDown(self):
+        dw.PROJECTS_DB = self._orig_db
+
+    def test_split_scoped_recognises_session_key(self):
+        self.assertEqual(
+            dw.split_scoped("session_abc.alpha", dw.known_slugs(self.db)),
+            ("session_abc", "alpha"),
+        )
+
+    def test_run_resolves_session_label_project(self):
+        """The label carries the project via the plugin's scoping; the shim
+        must find it and return the project path, not the active project."""
+        args = ["--label", "hermes-task-id=session_abc.alpha",
+                "-v", "/sandbox/workspace:/workspace"]
+        slug, path, already = dw._project_for_run(args, dict(dw.DEFAULT_CONFIG))
+        self.assertEqual(slug, "alpha")
+        self.assertEqual(path, self.project)
+        self.assertTrue(already)
+
+    def test_run_repoints_workspace_for_session_label(self):
+        args = ["--label", "hermes-task-id=session_abc.alpha",
+                "-v", "/sandbox/workspace:/workspace"]
+        out, notes = dw.rewrite_run_args(
+            args, "alpha", self.project, dict(dw.DEFAULT_CONFIG),
+            already_scoped=True,
+        )
+        self.assertIn(f"{self.project}:/workspace", out)
+        self.assertTrue(any("/workspace" in n and "->" in n for n in notes))
+
+    def test_ps_filter_matches_scoped_session_label(self):
+        """Hermes probes for the scoped label; the shim must find the
+        container without re-scoping an already-scoped id."""
+        filters = {}
+        dw._add_filter(filters, "label=hermes-task-id=session_abc.alpha", "beta")
+        self.assertEqual(filters["_labels"]["hermes-task-id"], "session_abc.alpha")
+
+
 class TestVolumeSplitting(unittest.TestCase):
     def test_simple(self):
         self.assertEqual(dw.split_volume("/a:/workspace"), ("/a", "/workspace", None))

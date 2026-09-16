@@ -245,12 +245,14 @@ class TestInstall(ScopeTestBase):
         self.assertTrue(ps.install(mod))
         self.assertEqual(mod._resolve_container_task_id("no-such-session"), "profile:work")
 
-    def test_leaves_session_key_alone(self):
-        '"session:abc" is per-session isolation — must not be scoped.'
+    def test_scopes_session_key(self):
+        '"session:abc" is a per-session container key for non-docker backends'\
+        ' (docker_profile_scoped is docker-only). It must be scoped by project'\
+        ' so the shim can repoint /workspace at the right directory.'
         make_dbs(self.home, [("p1", "alpha", self.alpha)], [("s", self.alpha)], "p1")
         mod = self._module("session:abc")
         ps.install(mod)
-        self.assertEqual(mod._resolve_container_task_id("s"), "session:abc")
+        self.assertEqual(mod._resolve_container_task_id("s"), "session:abc.alpha")
 
     def test_leaves_shared_key_alone(self):
         '"shared:team" is explicit opt-in sharing — must not be scoped.'
